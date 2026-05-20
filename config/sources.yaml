@@ -1,6 +1,12 @@
 # NewsBot Source Configuration
 # Organized by geographic tier and topic relevance
 # Topics: politics, economy, current_events
+#
+# Validated: May 2026
+# Reuters dropped public RSS in 2020 — replaced with Google News site: feeds
+# Axios has no native RSS — replaced with Google News site: feed
+# WSJ RSS is paywalled — replaced with Google News site: feed
+# The Hill URL corrected to syndication endpoint
 
 national:
   rss:
@@ -23,22 +29,25 @@ national:
       topics: [economy]
 
     - name: Reuters - Top News
-      url: https://feeds.reuters.com/reuters/topNews
+      url: https://news.google.com/rss/search?q=site:reuters.com&hl=en-US&gl=US&ceid=US:en
       bias_lean: center
       credibility: high
       topics: [politics, economy, current_events]
+      note: "Reuters dropped public RSS in 2020; proxied via Google News"
 
     - name: Reuters - Politics
-      url: https://feeds.reuters.com/Reuters/PoliticsNews
+      url: https://news.google.com/rss/search?q=site:reuters.com+politics&hl=en-US&gl=US&ceid=US:en
       bias_lean: center
       credibility: high
       topics: [politics]
+      note: "Google News proxy"
 
-    - name: Reuters - Business
-      url: https://feeds.reuters.com/reuters/businessNews
+    - name: Reuters - Economy
+      url: https://news.google.com/rss/search?q=site:reuters.com+economy+business&hl=en-US&gl=US&ceid=US:en
       bias_lean: center
       credibility: high
       topics: [economy]
+      note: "Google News proxy"
 
     - name: NPR News
       url: https://feeds.npr.org/1001/rss.xml
@@ -59,13 +68,14 @@ national:
       topics: [politics, economy, current_events]
 
     - name: Axios
-      url: https://api.axios.com/feed/
+      url: https://news.google.com/rss/search?q=site:axios.com&hl=en-US&gl=US&ceid=US:en
       bias_lean: center
       credibility: high
       topics: [politics, economy, current_events]
+      note: "Axios has no native RSS; proxied via Google News"
 
     - name: The Hill
-      url: https://thehill.com/feed/
+      url: https://thehill.com/rss/syndicator/19110
       bias_lean: center
       credibility: medium
       topics: [politics, economy]
@@ -89,10 +99,11 @@ national:
       topics: [politics]
 
     - name: Wall Street Journal - Economy
-      url: https://feeds.a.dj.com/rss/WSJcomUSBusiness.xml
+      url: https://news.google.com/rss/search?q=site:wsj.com+economy+business&hl=en-US&gl=US&ceid=US:en
       bias_lean: center-right
       credibility: high
       topics: [economy]
+      note: "WSJ native RSS is paywalled; proxied via Google News"
 
 state:
   # North Carolina
