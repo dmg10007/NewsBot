@@ -1,0 +1,88 @@
+# NewsBot Settings
+# Sensitive values (API keys, email addresses) must be set in .env
+# This file contains only non-sensitive configuration
+
+app:
+  name: NewsBot
+  timezone: America/New_York
+  log_level: INFO  # DEBUG | INFO | WARNING | ERROR
+
+schedule:
+  morning_digest:
+    hour: 6
+    minute: 0
+    lookback_hours: 12  # Articles published in the last 12 hours
+  evening_digest:
+    hour: 18
+    minute: 0
+    lookback_hours: 12
+
+topics:
+  enabled: [politics, economy, current_events]
+  current_events:
+    max_stories: 5  # Top 5 current_events stories per digest
+  politics:
+    max_stories: 10
+  economy:
+    max_stories: 5
+
+geography:
+  national: true
+  state: north_carolina
+  local: lee_county_nc
+  local_boost: 1.5  # Scoring multiplier for local stories
+
+ingestion:
+  request_timeout_seconds: 15
+  max_retries: 3
+  retry_backoff_seconds: 2
+  cache_ttl_seconds: 3600       # 1 hour — don't re-fetch the same feed
+  user_agent: "NewsBot/1.0 (personal news aggregator; contact via github)"
+  max_articles_per_source: 20  # Cap per source per run to avoid noise
+
+deduplication:
+  url_hash: true
+  headline_similarity_threshold: 0.92  # Cosine similarity — above this = duplicate
+
+clustering:
+  model: all-MiniLM-L6-v2
+  similarity_threshold: 0.72   # Stories above this score grouped into same cluster
+  min_sources_to_report: 1     # Report even single-source stories (local)
+  cross_tier_boost: true       # Boost clusters that appear in multiple tiers
+
+bias_detection:
+  always_run_lexicon: true
+  always_run_sentiment: true
+  llm_escalation_threshold: 0.35   # Escalate if sentiment variance > this across sources
+  llm_provider: perplexity          # perplexity | local
+  llm_model: sonar-reasoning
+  llm_fallback: local               # Falls back to llama.cpp if perplexity unavailable
+  llm_fallback_model: llama3        # Model name in your llama.cpp instance
+  max_llm_calls_per_run: 20         # Hard cap to control API costs
+
+summarization:
+  provider: local                   # local | anthropic
+  model: llama3                     # llama.cpp model name
+  max_summary_tokens: 150
+  neutral_prompt_version: v1        # Bump to invalidate cached prompts on change
+
+delivery:
+  email:
+    enabled: true
+    # NEWSBOT_EMAIL_TO and NEWSBOT_EMAIL_FROM set in .env
+    max_recipients: 5
+    subject_morning: "NewsBot Morning Briefing — {date}"
+    subject_evening: "NewsBot Evening Briefing — {date}"
+  telegram:
+    enabled: false   # Set to true and add NEWSBOT_TELEGRAM_TOKEN + NEWSBOT_TELEGRAM_CHAT_ID in .env
+
+scoring:
+  # Story importance weights — used to rank within topic buckets
+  weights:
+    source_credibility_high: 1.0
+    source_credibility_medium: 0.7
+    source_count: 0.3       # Per additional corroborating source
+    local_tier: 1.5         # Local stories boosted
+    state_tier: 1.2
+    national_tier: 1.0
+    recency_decay: 0.05     # Score reduction per hour of age

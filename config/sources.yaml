@@ -1,0 +1,174 @@
+# NewsBot Source Configuration
+# Organized by geographic tier and topic relevance
+# Topics: politics, economy, current_events
+
+national:
+  rss:
+    - name: AP News - Top Headlines
+      url: https://feeds.apnews.com/rss/topnews
+      bias_lean: center
+      credibility: high
+      topics: [politics, economy, current_events]
+
+    - name: AP News - Politics
+      url: https://feeds.apnews.com/rss/politics
+      bias_lean: center
+      credibility: high
+      topics: [politics]
+
+    - name: AP News - Economy
+      url: https://feeds.apnews.com/rss/business
+      bias_lean: center
+      credibility: high
+      topics: [economy]
+
+    - name: Reuters - Top News
+      url: https://feeds.reuters.com/reuters/topNews
+      bias_lean: center
+      credibility: high
+      topics: [politics, economy, current_events]
+
+    - name: Reuters - Politics
+      url: https://feeds.reuters.com/Reuters/PoliticsNews
+      bias_lean: center
+      credibility: high
+      topics: [politics]
+
+    - name: Reuters - Business
+      url: https://feeds.reuters.com/reuters/businessNews
+      bias_lean: center
+      credibility: high
+      topics: [economy]
+
+    - name: NPR News
+      url: https://feeds.npr.org/1001/rss.xml
+      bias_lean: center-left
+      credibility: high
+      topics: [politics, economy, current_events]
+
+    - name: NPR Politics
+      url: https://feeds.npr.org/1014/rss.xml
+      bias_lean: center-left
+      credibility: high
+      topics: [politics]
+
+    - name: PBS NewsHour
+      url: https://www.pbs.org/newshour/feeds/rss/headlines
+      bias_lean: center-left
+      credibility: high
+      topics: [politics, economy, current_events]
+
+    - name: Axios
+      url: https://api.axios.com/feed/
+      bias_lean: center
+      credibility: high
+      topics: [politics, economy, current_events]
+
+    - name: The Hill
+      url: https://thehill.com/feed/
+      bias_lean: center
+      credibility: medium
+      topics: [politics, economy]
+
+    - name: Fox News - Politics
+      url: https://moxie.foxnews.com/google-publisher/politics.xml
+      bias_lean: right
+      credibility: medium
+      topics: [politics]
+
+    - name: Fox News - Economy
+      url: https://moxie.foxnews.com/google-publisher/business.xml
+      bias_lean: right
+      credibility: medium
+      topics: [economy]
+
+    - name: CNN - Politics
+      url: http://rss.cnn.com/rss/cnn_allpolitics.rss
+      bias_lean: center-left
+      credibility: medium
+      topics: [politics]
+
+    - name: Wall Street Journal - Economy
+      url: https://feeds.a.dj.com/rss/WSJcomUSBusiness.xml
+      bias_lean: center-right
+      credibility: high
+      topics: [economy]
+
+state:
+  # North Carolina
+  rss:
+    - name: WRAL News
+      url: https://www.wral.com/rss/news/
+      bias_lean: center
+      credibility: high
+      topics: [politics, economy, current_events]
+      region: north_carolina
+
+    - name: WRAL Politics
+      url: https://www.wral.com/rss/politics/
+      bias_lean: center
+      credibility: high
+      topics: [politics]
+      region: north_carolina
+
+    - name: NC Policy Watch
+      url: http://www.ncpolicywatch.com/feed/
+      bias_lean: center-left
+      credibility: medium
+      topics: [politics, economy]
+      region: north_carolina
+
+    - name: Carolina Public Press
+      url: https://carolinapublicpress.org/feed/
+      bias_lean: center
+      credibility: high
+      topics: [politics, economy, current_events]
+      region: north_carolina
+
+    - name: WCNC Charlotte
+      url: https://www.wcnc.com/feeds/syndication/rss/news
+      bias_lean: center
+      credibility: medium
+      topics: [politics, current_events]
+      region: north_carolina
+
+  scrapers:
+    - name: Charlotte Observer
+      url: https://www.charlotteobserver.com
+      rss_url: https://www.charlotteobserver.com/news/?widgetName=rssfeed&widgetContentId=712015&getXmlFeed=true
+      bias_lean: center-left
+      credibility: high
+      topics: [politics, economy, current_events]
+      region: north_carolina
+      scraper_class: CharlotteObserverScraper
+
+local:
+  # Lee County, NC
+  scrapers:
+    - name: Sanford Herald
+      url: https://www.sanfordherald.com
+      bias_lean: center
+      credibility: medium
+      topics: [politics, economy, current_events]
+      region: lee_county_nc
+      scraper_class: SanfordHeraldScraper
+      selectors:
+        article_list: "article.tnt-section-news, .tnt-asset-type-article"
+        headline: "h3.tnt-headline a, h2.tnt-headline a"
+        summary: "p.tnt-summary"
+        link: "h3.tnt-headline a, h2.tnt-headline a"
+        date: "time.tnt-date"
+
+    - name: The Rant NC
+      url: https://rantnc.com
+      bias_lean: center
+      credibility: medium
+      topics: [politics, current_events]
+      region: lee_county_nc
+      scraper_class: RantNCScraper
+      selectors:
+        article_list: "article, .post"
+        headline: "h2.entry-title a, h1.entry-title a"
+        summary: ".entry-summary p, .entry-content p:first-of-type"
+        link: "h2.entry-title a, h1.entry-title a"
+        date: "time.entry-date, .post-date"
