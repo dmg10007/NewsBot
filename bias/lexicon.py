@@ -1,94 +1,115 @@
-"""Lexicon and sentiment heuristics — first pass of bias detection.
+"""Stage 1 bias detection: loaded word lexicon and sentiment heuristics.
 
-Runs on every cluster, cheaply and offline.
-Flags clusters that warrant LLM escalation based on:
-  - Loaded word density
-  - Sentiment variance across sources
-  - Presence of known framing patterns
+This runs on every cluster — fast, free, no API calls.
+Output feeds into the escalation decision for LLM analysis.
 
-Outputs a BiasSignal per cluster that the LLM analyzer uses to decide
-whether to escalate.
+Detects:
+  - Loaded/charged language (words with strong connotative weight)
+  - Sentiment asymmetry across sources covering the same story
+  - Framing signal words (hedge words, attribution language)
 """
 
 from __future__ import annotations
 
 import logging
-import statistics
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 from clustering.clusterer import StoryCluster
-from config.loader import get_settings
-from parsing.extractor import LOADED_WORD_LEXICON
+from parsing.extractor import ParsedArticle
 
 logger = logging.getLogger(__name__)
 
+# Loaded word lists — words that carry strong ideological or emotional charge
+# These are not inherently wrong to use, but their presence across a cluster
+# warrants deeper analysis. Sourced from journalism bias research.
+_LOADED_WORDS: set[str] = {
+    # Politically charged
+    "radical", "extremist", "socialist", "communist", "fascist", "globalist",
+    "elites", "regime", "propaganda", "indoctrination", "woke", "agenda",
+    "invasion", "crisis", "catastrophe", "disaster", "collapse", "chaos",
+    "corrupt", "rigged", "stolen", "illegitimate", "fraud",
+    # Immigration framing
+    "illegal alien", "illegal immigrant", "undocumented", "migrant", "refugee",
+    "border crisis", "open border",
+    # Economic framing
+    "job-killing", "tax hike", "handout", "entitlement", "bailout", "bloated",
+    "burden", "wasteful", "irresponsible",
+    # Emotional loading
+    "horrific", "outrageous", "shameful", "disgusting", "dangerous", "alarming",
+    "shocking", "stunning", "explosive", "bombshell",
+}
+
+# Hedge / epistemic markers — signal uncertain or attributed claims
+_HEDGE_WORDS: set[str] = {
+    "allegedly", "reportedly", "claims", "said to", "sources say",
+    "according to", "unverified", "disputed", "questioned", "appears to",
+    "may have", "could be", "might be", "is believed to",
+}
+
 
 @dataclass
-class BiasSignal:
-    """Heuristic bias indicators for a story cluster."""
+class LexiconResult:
     cluster_id: int
-    loaded_word_hits: dict[str, list[str]] = field(default_factory=dict)
-    # {source_name: [loaded_words_found]}
-    sentiment_scores: dict[str, float] = field(default_factory=dict)
-    # {source_name: compound_score}
-    sentiment_variance: float = 0.0
-    escalate_to_llm: bool = False
-    escalation_reasons: list[str] = field(default_factory=list)
+    loaded_words_found: dict[str, list[str]]   # source_name -> [loaded words found]
+    sentiment_variance: float                   # Variance of compound scores across sources
+    sentiment_by_source: dict[str, float]       # source_name -> compound score
+    hedge_words_found: dict[str, list[str]]     # source_name -> [hedge words found]
+    escalate: bool                              # True if LLM analysis is warranted
+    escalation_reasons: list[str]
 
 
 class LexiconAnalyzer:
-    """Runs heuristic bias detection on all clusters."""
+    """Runs fast lexicon and sentiment analysis on a StoryCluster."""
 
-    def __init__(self) -> None:
-        self.settings = get_settings()
-        self._threshold: float = self.settings["bias_detection"][
-            "llm_escalation_threshold"
-        ]
+    def __init__(self, escalation_threshold: float = 0.35) -> None:
+        self.escalation_threshold = escalation_threshold
 
-    def analyze_all(self, clusters: list[StoryCluster]) -> list[BiasSignal]:
-        signals = [self._analyze(cluster) for cluster in clusters]
-        escalated = sum(1 for s in signals if s.escalate_to_llm)
-        logger.info(
-            "Lexicon analysis: %d clusters, %d flagged for LLM escalation",
-            len(signals), escalated,
-        )
-        return signals
-
-    def _analyze(self, cluster: StoryCluster) -> BiasSignal:
-        signal = BiasSignal(cluster_id=cluster.cluster_id)
+    def analyze(self, cluster: StoryCluster) -> LexiconResult:
+        loaded_found: dict[str, list[str]] = {}
+        hedge_found: dict[str, list[str]] = {}
+        sentiment_by_source: dict[str, float] = {}
 
         for article in cluster.articles:
-            name = article.raw.source_name
-            signal.sentiment_scores[name] = article.sentiment_score
-            signal.loaded_word_hits[name] = article.loaded_words_found
+            source = article.raw.source_name
+            text_lower = article.full_text.lower()
 
-        # Sentiment variance across sources in this cluster
-        scores = list(signal.sentiment_scores.values())
-        if len(scores) >= 2:
-            signal.sentiment_variance = statistics.variance(scores)
-        elif len(scores) == 1:
-            signal.sentiment_variance = 0.0
+            loaded_found[source] = [
+                w for w in _LOADED_WORDS if w in text_lower
+            ]
+            hedge_found[source] = [
+                w for w in _HEDGE_WORDS if w in text_lower
+            ]
+            sentiment_by_source[source] = article.sentiment_compound
 
-        # Escalation decision
-        reasons: list[str] = []
+        scores = list(sentiment_by_source.values())
+        variance = float(_variance(scores)) if len(scores) > 1 else 0.0
 
-        if signal.sentiment_variance > self._threshold:
-            reasons.append(
-                f"High sentiment variance across sources: {signal.sentiment_variance:.3f}"
+        escalation_reasons: list[str] = []
+        if variance > self.escalation_threshold:
+            escalation_reasons.append(
+                f"Sentiment variance {variance:.3f} exceeds threshold {self.escalation_threshold}"
             )
+        any_loaded = any(v for v in loaded_found.values())
+        if any_loaded:
+            escalation_reasons.append("Loaded language detected in one or more sources")
+        if cluster.has_cross_lean_coverage:
+            escalation_reasons.append("Cross-lean coverage detected — framing comparison warranted")
 
-        total_loaded = sum(len(v) for v in signal.loaded_word_hits.values())
-        if total_loaded >= 3:
-            all_hits = [w for hits in signal.loaded_word_hits.values() for w in hits]
-            reasons.append(f"Loaded language detected: {', '.join(set(all_hits))}")
+        escalate = bool(escalation_reasons)
 
-        # Multi-source clusters with opposing sentiment polarity warrant review
-        if len(scores) >= 2:
-            has_positive = any(s > 0.2 for s in scores)
-            has_negative = any(s < -0.2 for s in scores)
-            if has_positive and has_negative:
-                reasons.append("Opposing sentiment polarity across sources")
+        return LexiconResult(
+            cluster_id=cluster.cluster_id,
+            loaded_words_found=loaded_found,
+            sentiment_variance=variance,
+            sentiment_by_source=sentiment_by_source,
+            hedge_words_found=hedge_found,
+            escalate=escalate,
+            escalation_reasons=escalation_reasons,
+        )
 
-        signal.escalation_reasons = reasons
-        signal.escalate_to_llm = len(reasons) > 0
-        return signal
+
+def _variance(values: list[float]) -> float:
+    if len(values) < 2:
+        return 0.0
+    mean = sum(values) / len(values)
+    return sum((v - mean) ** 2 for v in values) / len(values)

@@ -1,83 +1,77 @@
-"""Normalization of parsed articles before clustering.
+"""Entity and date normalization across sources.
 
-Handles:
-- Canonical entity name resolution (e.g., 'Joe Biden' / 'Biden' -> 'Joe Biden')
-- Date normalization to UTC
-- Headline cleanup (strip HTML entities, excessive whitespace)
-- Deduplication of entity lists per article
+Ensures that the same real-world entity referred to differently across
+outlets ("GOP", "Republican Party", "Republicans") maps to a single
+canonical form for accurate cross-source comparison.
 """
 
 from __future__ import annotations
 
-import html
-import logging
 import re
-from collections import Counter
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Optional
 
 from parsing.extractor import ParsedArticle
 
-logger = logging.getLogger(__name__)
+# Canonical entity map — maps surface form variants to a single canonical string.
+# Expand this over time as new aliases are observed in the wild.
+_ENTITY_ALIASES: dict[str, str] = {
+    # Parties
+    "gop": "Republican Party",
+    "republicans": "Republican Party",
+    "the republican party": "Republican Party",
+    "democrats": "Democratic Party",
+    "the democratic party": "Democratic Party",
+    "dems": "Democratic Party",
+    # Executive
+    "the white house": "White House",
+    "the president": "President of the United States",
+    "potus": "President of the United States",
+    # Legislature
+    "the senate": "U.S. Senate",
+    "the house": "U.S. House of Representatives",
+    "congress": "U.S. Congress",
+    "capitol hill": "U.S. Congress",
+    # Federal agencies
+    "the fed": "Federal Reserve",
+    "federal reserve": "Federal Reserve",
+    "doj": "Department of Justice",
+    "fbi": "Federal Bureau of Investigation",
+    "dhs": "Department of Homeland Security",
+    "irs": "Internal Revenue Service",
+    # NC-specific
+    "nc": "North Carolina",
+    "n.c.": "North Carolina",
+    "the general assembly": "NC General Assembly",
+    "raleigh": "Raleigh, NC",
+    "sanford": "Sanford, NC",
+    "lee county": "Lee County, NC",
+}
 
 
-class ArticleNormalizer:
-    """Normalizes a list of ParsedArticles for downstream consistency."""
+class Normalizer:
+    """Normalizes entities and dates in ParsedArticles."""
 
     def normalize_all(self, articles: list[ParsedArticle]) -> list[ParsedArticle]:
-        normalized = [self._normalize(a) for a in articles]
-        logger.info("Normalized %d articles", len(normalized))
+        for article in articles:
+            article.entities = self._normalize_entities(article.entities)
+            if article.raw.published_at:
+                article.raw.published_at = self._normalize_date(article.raw.published_at)
+        return articles
+
+    def _normalize_entities(self, entities: list[tuple[str, str]]) -> list[tuple[str, str]]:
+        normalized = []
+        seen: set[str] = set()
+        for text, label in entities:
+            canonical = _ENTITY_ALIASES.get(text.lower(), text)
+            key = (canonical.lower(), label)
+            if key not in seen:
+                seen.add(key)
+                normalized.append((canonical, label))
         return normalized
 
-    def _normalize(self, article: ParsedArticle) -> ParsedArticle:
-        raw = article.raw
-
-        # Clean headline and summary
-        raw.headline = _clean_text(raw.headline)
-        raw.summary = _clean_text(raw.summary)
-
-        # Normalize published_at to UTC if naive
-        if raw.published_at and raw.published_at.tzinfo is None:
-            raw.published_at = raw.published_at.replace(tzinfo=timezone.utc)
-
-        # Deduplicate entities, keep most-frequent canonical form
-        article.entities = _canonical_entities(article.entities)
-
-        return article
-
-
-def _clean_text(text: str) -> str:
-    """Strip HTML entities, tags, and normalize whitespace."""
-    text = html.unescape(text)
-    text = re.sub(r"<[^>]+>", "", text)       # Strip HTML tags
-    text = re.sub(r"\s+", " ", text).strip()  # Normalize whitespace
-    return text
-
-
-def _canonical_entities(
-    entities: list[tuple[str, str]]
-) -> list[tuple[str, str]]:
-    """Deduplicate entities, prefer the longest form of the same name.
-
-    e.g. [("Biden", "PERSON"), ("Joe Biden", "PERSON")] -> [("Joe Biden", "PERSON")]
-    """
-    if not entities:
-        return []
-
-    # Group by label
-    by_label: dict[str, list[str]] = {}
-    for text, label in entities:
-        by_label.setdefault(label, []).append(text)
-
-    canonical: list[tuple[str, str]] = []
-    for label, names in by_label.items():
-        # For each cluster of names that share a token, keep the longest
-        kept: list[str] = []
-        for name in sorted(set(names), key=len, reverse=True):
-            # Only keep if not already a substring of a kept name
-            if not any(name.lower() in k.lower() for k in kept):
-                kept.append(name)
-        for name in kept:
-            canonical.append((name, label))
-
-    return canonical
+    def _normalize_date(self, dt: datetime) -> datetime:
+        """Ensure timezone-aware UTC datetime."""
+        if dt.tzinfo is None:
+            return dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)

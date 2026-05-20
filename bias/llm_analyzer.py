@@ -1,202 +1,203 @@
-"""LLM-assisted bias analysis — Perplexity Sonar with llama.cpp fallback.
+"""Stage 3 bias detection: LLM-assisted cross-source claim analysis.
 
-Only called for clusters flagged by lexicon.py or framing.py.
-Outputs a BiasReport per cluster: what was stripped, what remains as fact.
+Only called for clusters that passed lexicon.py escalation threshold.
+Uses Perplexity Sonar (sonar-reasoning) as primary, with llama.cpp as fallback.
 
-Perplexity Sonar (sonar-reasoning) is used as the primary provider because
-its web-grounded reasoning is well-suited to cross-source claim comparison.
-llama.cpp is the offline fallback when Sonar is unavailable or the daily
-call cap is reached.
+Outputs:
+  - A list of factual claims extracted from the cluster
+  - Identified framing differences between sources
+  - A bias_notes field for the digest: plain-language explanation of what
+    was stripped and why, without introducing a new directional lean
+
+Design principle: The LLM is a LABELER, not a judge. It identifies and
+names differences; it does not declare which source is correct.
 """
 
 from __future__ import annotations
 
 import logging
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional
 
 import httpx
 
-from bias.lexicon import BiasSignal
+from bias.framing import FramingResult
 from clustering.clusterer import StoryCluster
-from config.loader import get_settings
 
 logger = logging.getLogger(__name__)
 
-PPLX_API_URL = "https://api.perplexity.ai/chat/completions"
-LLAMA_DEFAULT_URL = "http://localhost:8080/v1/chat/completions"
+_PPLX_API_URL = "https://api.perplexity.ai/chat/completions"
+_LLAMA_DEFAULT_URL = "http://localhost:8080/v1/chat/completions"
 
 
 @dataclass
-class BiasReport:
-    """Full bias analysis result for a single story cluster."""
+class LLMAnalysisResult:
     cluster_id: int
-    provider_used: str  # 'perplexity' | 'local' | 'heuristic_only'
-    factual_summary: str = ""         # Stripped, neutral facts only
-    stripped_elements: list[str] = field(default_factory=list)   # What was removed and why
-    confidence: str = "low"           # low | medium | high
-    escalated: bool = False
-    error: Optional[str] = None
+    extracted_facts: list[str]        # Verifiable factual claims found across all sources
+    framing_notes: list[str]          # Plain-language descriptions of framing differences
+    bias_notes: str                   # Short paragraph for digest — what was stripped and why
+    provider_used: str                # "perplexity" | "local" | "none"
+    skipped: bool = False             # True if max_llm_calls cap was hit
 
 
-class LLMBiasAnalyzer:
-    """Runs LLM-assisted bias analysis on flagged clusters."""
+class LLMAnalyzer:
+    """Calls Perplexity Sonar or local llama.cpp for bias/framing analysis."""
 
-    def __init__(self) -> None:
-        self.settings = get_settings()
+    def __init__(self, max_calls: int = 20) -> None:
+        self.max_calls = max_calls
         self._calls_made = 0
-        self._call_cap: int = self.settings["bias_detection"]["max_llm_calls_per_run"]
-        self._pplx_key: Optional[str] = os.getenv("PPLX_API_KEY")
-        self._llama_url: str = os.getenv("LLAMA_CPP_BASE_URL", LLAMA_DEFAULT_URL)
-        self._llama_model: str = os.getenv(
-            "LLAMA_CPP_MODEL",
-            self.settings["bias_detection"]["llm_fallback_model"]
-        )
-        self._client = httpx.Client(timeout=60)
+        self._pplx_key = os.getenv("PPLX_API_KEY", "")
+        self._llama_url = os.getenv("LLAMA_CPP_BASE_URL", _LLAMA_DEFAULT_URL)
+        self._llama_model = os.getenv("LLAMA_CPP_MODEL", "llama3")
+        self._client = httpx.Client(timeout=60.0)
 
-    def analyze_flagged(
+    def analyze(
         self,
-        clusters: list[StoryCluster],
-        signals: list[BiasSignal],
-    ) -> list[BiasReport]:
-        reports: list[BiasReport] = []
-        for cluster, signal in zip(clusters, signals):
-            if signal.escalate_to_llm and self._calls_made < self._call_cap:
-                report = self._run_llm_analysis(cluster, signal)
-            else:
-                # Heuristic-only report — no LLM call
-                report = BiasReport(
-                    cluster_id=cluster.cluster_id,
-                    provider_used="heuristic_only",
-                    escalated=signal.escalate_to_llm,
-                    confidence="low" if signal.escalate_to_llm else "medium",
-                )
-            reports.append(report)
-
-        llm_used = sum(1 for r in reports if r.provider_used != "heuristic_only")
-        logger.info(
-            "Bias analysis complete: %d LLM calls made (%d cap)",
-            llm_used, self._call_cap,
-        )
-        return reports
-
-    def _run_llm_analysis(
-        self, cluster: StoryCluster, signal: BiasSignal
-    ) -> BiasReport:
-        prompt = self._build_prompt(cluster, signal)
-        provider = self.settings["bias_detection"]["llm_provider"]
-
-        # Try primary provider
-        if provider == "perplexity" and self._pplx_key:
-            try:
-                result = self._call_perplexity(prompt)
-                self._calls_made += 1
-                return self._parse_response(
-                    cluster.cluster_id, result, provider="perplexity"
-                )
-            except Exception as exc:
-                logger.warning("Perplexity call failed, falling back to local: %s", exc)
-
-        # Fallback to llama.cpp
-        try:
-            result = self._call_llama(prompt)
-            self._calls_made += 1
-            return self._parse_response(
-                cluster.cluster_id, result, provider="local"
-            )
-        except Exception as exc:
-            logger.error("Local LLM also failed for cluster %d: %s", cluster.cluster_id, exc)
-            return BiasReport(
+        cluster: StoryCluster,
+        framing: FramingResult,
+    ) -> LLMAnalysisResult:
+        if self._calls_made >= self.max_calls:
+            logger.warning("LLM call cap (%d) reached — skipping cluster %d", self.max_calls, cluster.cluster_id)
+            return LLMAnalysisResult(
                 cluster_id=cluster.cluster_id,
+                extracted_facts=[],
+                framing_notes=[],
+                bias_notes="Analysis skipped: daily LLM call limit reached.",
                 provider_used="none",
-                error=str(exc),
-                escalated=True,
-                confidence="low",
+                skipped=True,
             )
 
-    def _build_prompt(self, cluster: StoryCluster, signal: BiasSignal) -> str:
-        articles_text = "\n".join(
-            f"- [{a.raw.source_name} / {a.raw.bias_lean}] \"{a.raw.headline}\""
-            f"{' | ' + a.raw.summary[:200] if a.raw.summary else ''}"
-            for a in cluster.articles[:6]  # Cap at 6 articles per prompt
+        prompt = self._build_prompt(cluster, framing)
+
+        if self._pplx_key:
+            try:
+                result = self._call_perplexity(cluster.cluster_id, prompt)
+                self._calls_made += 1
+                return result
+            except Exception as exc:
+                logger.warning("Perplexity call failed for cluster %d: %s. Falling back to local.", cluster.cluster_id, exc)
+
+        try:
+            result = self._call_local(cluster.cluster_id, prompt)
+            self._calls_made += 1
+            return result
+        except Exception as exc:
+            logger.error("Local LLM call also failed for cluster %d: %s", cluster.cluster_id, exc)
+            return LLMAnalysisResult(
+                cluster_id=cluster.cluster_id,
+                extracted_facts=[],
+                framing_notes=[framing.cross_source_summary],
+                bias_notes="Automated bias analysis unavailable for this story.",
+                provider_used="none",
+            )
+
+    def _build_prompt(self, cluster: StoryCluster, framing: FramingResult) -> str:
+        articles_text = "\n\n".join(
+            f"SOURCE: {a.raw.source_name} (lean: {a.raw.bias_lean})\n"
+            f"HEADLINE: {a.raw.headline}\n"
+            f"SUMMARY: {a.raw.summary}"
+            for a in cluster.articles
         )
-        flags_text = "\n".join(f"  * {r}" for r in signal.escalation_reasons)
+        return f"""You are a neutral fact-extraction assistant. Your job is to analyze how multiple news sources cover the same story and identify:
+1. The core verifiable factual claims present across sources
+2. Framing differences: word choices, emphasis, or omissions that differ between sources
+3. A short, neutral "bias notes" paragraph (2-3 sentences) describing what editorial choices were detected, WITHOUT declaring which source is correct
 
-        return f"""You are a neutral fact-extraction assistant. Your job is to strip bias, spin, and editorial framing from news coverage and return only verifiable facts.
+Rules:
+- Do not introduce your own political lean
+- Distinguish between verified facts and attributed claims
+- Use plain language
+- Return your response in this exact format:
 
-The following articles cover the same story from different sources. Bias flags were raised:
-{flags_text}
+FACTS:
+- [fact 1]
+- [fact 2]
 
-Articles:
+FRAMING:
+- [framing observation 1]
+- [framing observation 2]
+
+BIAS NOTES:
+[2-3 sentence paragraph]
+
+---
+ARTICLES TO ANALYZE:
 {articles_text}
 
-Your task:
-1. FACTUAL SUMMARY: Write 2-3 sentences containing only verifiable facts agreed upon across sources. No loaded language. No editorial framing. Active voice. No opinion.
-2. STRIPPED ELEMENTS: List each specific bias element removed and why (e.g. 'loaded word: \"invasion\" — replaced with neutral \"border crossing increase\"').
-3. CONFIDENCE: Rate your confidence in the factual summary as low / medium / high based on how much sources agreed.
+PREVIOUS ANALYSIS CONTEXT:
+{framing.cross_source_summary}
+"""
 
-Respond in exactly this format:
-FACTUAL_SUMMARY: <your summary>
-STRIPPED: <item 1> | <item 2> | ...
-CONFIDENCE: <low|medium|high>"""
-
-    def _call_perplexity(self, prompt: str) -> str:
-        model = self.settings["bias_detection"]["llm_model"]
+    def _call_perplexity(self, cluster_id: int, prompt: str) -> LLMAnalysisResult:
+        payload = {
+            "model": "sonar-reasoning",
+            "messages": [
+                {"role": "system", "content": "You are a neutral journalism analysis assistant."},
+                {"role": "user", "content": prompt},
+            ],
+            "max_tokens": 600,
+            "temperature": 0.1,
+        }
         response = self._client.post(
-            PPLX_API_URL,
+            _PPLX_API_URL,
+            json=payload,
             headers={
                 "Authorization": f"Bearer {self._pplx_key}",
                 "Content-Type": "application/json",
             },
-            json={
-                "model": model,
-                "messages": [{"role": "user", "content": prompt}],
-                "max_tokens": 400,
-                "temperature": 0.1,  # Low temp for factual tasks
-            },
         )
         response.raise_for_status()
-        return response.json()["choices"][0]["message"]["content"]
+        content = response.json()["choices"][0]["message"]["content"]
+        logger.info("Perplexity analysis complete for cluster %d", cluster_id)
+        return self._parse_llm_response(cluster_id, content, "perplexity")
 
-    def _call_llama(self, prompt: str) -> str:
+    def _call_local(self, cluster_id: int, prompt: str) -> LLMAnalysisResult:
+        payload = {
+            "model": self._llama_model,
+            "messages": [
+                {"role": "system", "content": "You are a neutral journalism analysis assistant."},
+                {"role": "user", "content": prompt},
+            ],
+            "max_tokens": 600,
+            "temperature": 0.1,
+        }
         response = self._client.post(
             f"{self._llama_url.rstrip('/')}/v1/chat/completions",
-            json={
-                "model": self._llama_model,
-                "messages": [{"role": "user", "content": prompt}],
-                "max_tokens": 400,
-                "temperature": 0.1,
-            },
+            json=payload,
         )
         response.raise_for_status()
-        return response.json()["choices"][0]["message"]["content"]
+        content = response.json()["choices"][0]["message"]["content"]
+        logger.info("Local LLM analysis complete for cluster %d", cluster_id)
+        return self._parse_llm_response(cluster_id, content, "local")
 
-    def _parse_response(
-        self, cluster_id: int, response_text: str, provider: str
-    ) -> BiasReport:
-        factual_summary = ""
-        stripped: list[str] = []
-        confidence = "low"
+    def _parse_llm_response(self, cluster_id: int, content: str, provider: str) -> LLMAnalysisResult:
+        facts: list[str] = []
+        framing_notes: list[str] = []
+        bias_notes = ""
 
-        for line in response_text.strip().splitlines():
-            if line.startswith("FACTUAL_SUMMARY:"):
-                factual_summary = line.replace("FACTUAL_SUMMARY:", "").strip()
-            elif line.startswith("STRIPPED:"):
-                raw_stripped = line.replace("STRIPPED:", "").strip()
-                stripped = [s.strip() for s in raw_stripped.split("|") if s.strip()]
-            elif line.startswith("CONFIDENCE:"):
-                confidence = line.replace("CONFIDENCE:", "").strip().lower()
-                if confidence not in ("low", "medium", "high"):
-                    confidence = "low"
+        section = None
+        for line in content.splitlines():
+            line = line.strip()
+            if line.upper().startswith("FACTS:"):
+                section = "facts"
+            elif line.upper().startswith("FRAMING:"):
+                section = "framing"
+            elif line.upper().startswith("BIAS NOTES:"):
+                section = "bias"
+            elif line.startswith("-") and section == "facts":
+                facts.append(line[1:].strip())
+            elif line.startswith("-") and section == "framing":
+                framing_notes.append(line[1:].strip())
+            elif section == "bias" and line:
+                bias_notes += (" " + line) if bias_notes else line
 
-        return BiasReport(
+        return LLMAnalysisResult(
             cluster_id=cluster_id,
+            extracted_facts=facts,
+            framing_notes=framing_notes,
+            bias_notes=bias_notes.strip() or "No significant framing differences detected.",
             provider_used=provider,
-            factual_summary=factual_summary,
-            stripped_elements=stripped,
-            confidence=confidence,
-            escalated=True,
         )
 
     def close(self) -> None:

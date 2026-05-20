@@ -1,114 +1,119 @@
-"""Cross-source framing comparison.
+"""Stage 2 bias detection: cross-source entity and framing comparison.
 
-Compares how different outlets describe the same named entities
-within a cluster. Detects systematic differences in:
-  - Which entities are mentioned / omitted
-  - Entity co-occurrence patterns (who is linked to what)
-  - Linguistic framing around key entities (verbs, adjectives nearby)
+Compares how different outlets frame the same story:
+  - Entity label differences (same person/place described differently)
+  - Omission detection (entities present in some sources but absent in others)
+  - Attribution asymmetry (one source hedges a claim, another states it as fact)
 
-This runs before LLM escalation and enriches the BiasSignal with
-specific framing observations that get passed to the LLM prompt.
+This runs only on clusters flagged for escalation by lexicon.py.
+Output is passed to llm_analyzer.py for final LLM-assisted analysis.
 """
 
 from __future__ import annotations
 
 import logging
-from collections import defaultdict
+from dataclasses import dataclass
+from collections import Counter
 
 from clustering.clusterer import StoryCluster
-from bias.lexicon import BiasSignal
+from parsing.extractor import ParsedArticle
 
 logger = logging.getLogger(__name__)
 
 
-@dataclass_workaround = None  # noqa — dataclass used via BiasSignal; no new class needed
+@dataclass
+class FramingResult:
+    cluster_id: int
+    entity_omissions: list[str]           # Entities mentioned in >50% of sources but absent in some
+    framing_differences: list[str]        # Human-readable descriptions of detected framing gaps
+    attribution_asymmetry: list[str]      # Sources that hedge where others state as fact
+    cross_source_summary: str             # Short text description for LLM prompt context
 
 
 class FramingAnalyzer:
-    """Enriches BiasSignals with entity framing observations."""
+    """Detects framing differences and omissions across sources in a cluster."""
 
-    def analyze_all(
-        self,
-        clusters: list[StoryCluster],
-        signals: list[BiasSignal],
-    ) -> list[BiasSignal]:
-        for cluster, signal in zip(clusters, signals):
-            self._analyze(cluster, signal)
-        framing_flagged = sum(
-            1 for s in signals
-            if any("framing" in r.lower() or "entity" in r.lower()
-                   for r in s.escalation_reasons)
-        )
-        logger.info("Framing analysis complete. %d clusters with entity framing flags", framing_flagged)
-        return signals
+    def analyze(self, cluster: StoryCluster) -> FramingResult:
+        articles = cluster.articles
+        n = len(articles)
 
-    def _analyze(self, cluster: StoryCluster, signal: BiasSignal) -> None:
-        if len(cluster.articles) < 2:
-            return  # Need at least 2 sources to compare framing
+        # Entity omission: entities appearing in majority of sources but not all
+        entity_counter: Counter[str] = Counter()
+        entity_by_source: dict[str, set[str]] = {}
+        for article in articles:
+            source = article.raw.source_name
+            entity_by_source[source] = {e[0] for e in article.entities}
+            for entity_text, _ in article.entities:
+                entity_counter[entity_text] += 1
 
-        # Build per-source entity sets
-        source_entities: dict[str, set[str]] = {}
-        for article in cluster.articles:
-            entity_texts = {e[0].lower() for e in article.entities}
-            source_entities[article.raw.source_name] = entity_texts
+        majority_threshold = max(2, int(n * 0.5))
+        majority_entities = {
+            e for e, count in entity_counter.items() if count >= majority_threshold
+        }
+        omissions: list[str] = []
+        for entity in majority_entities:
+            missing_in = [
+                source for source, entities in entity_by_source.items()
+                if entity not in entities
+            ]
+            if missing_in:
+                omissions.append(
+                    f"'{entity}' mentioned in {entity_counter[entity]}/{n} sources "
+                    f"but absent in: {', '.join(missing_in)}"
+                )
 
-        if len(source_entities) < 2:
-            return
-
-        sources = list(source_entities.keys())
-        all_entities = set().union(*source_entities.values())
-
-        # Detect entities present in some sources but absent in others
-        omitted: dict[str, list[str]] = defaultdict(list)
-        for entity in all_entities:
-            mentioning = [s for s in sources if entity in source_entities[s]]
-            omitting = [s for s in sources if entity not in source_entities[s]]
-            # Only flag if entity appears in majority but not all
-            if len(mentioning) >= max(1, len(sources) // 2) and omitting:
-                for src in omitting:
-                    omitted[src].append(entity)
-
-        if omitted:
-            omission_desc = "; ".join(
-                f"{src} omits: {', '.join(entities[:3])}"
-                for src, entities in list(omitted.items())[:3]
+        # Attribution asymmetry: hedge words present in some sources but not others
+        from bias.lexicon import _HEDGE_WORDS
+        hedge_by_source: dict[str, bool] = {}
+        for article in articles:
+            text_lower = article.full_text.lower()
+            hedge_by_source[article.raw.source_name] = any(
+                w in text_lower for w in _HEDGE_WORDS
             )
-            signal.escalation_reasons.append(f"Entity omission detected — {omission_desc}")
-            signal.escalate_to_llm = True
+        hedgers = [s for s, h in hedge_by_source.items() if h]
+        asserters = [s for s, h in hedge_by_source.items() if not h]
+        attribution_asymmetry: list[str] = []
+        if hedgers and asserters and n > 1:
+            attribution_asymmetry.append(
+                f"Sources using hedge language: {', '.join(hedgers)}. "
+                f"Sources stating as fact: {', '.join(asserters)}."
+            )
 
-        # Flag cross-source entity labeling differences
-        # e.g. 'migrants' vs 'illegal immigrants' vs 'asylum seekers'
-        self._detect_label_divergence(cluster, signal)
+        # Framing differences: bias-lean divergence on same story
+        framing_differences: list[str] = []
+        if cluster.has_cross_lean_coverage:
+            left_sources = [
+                a.raw.source_name for a in articles
+                if a.raw.bias_lean in ("left", "center-left")
+            ]
+            right_sources = [
+                a.raw.source_name for a in articles
+                if a.raw.bias_lean in ("right", "center-right")
+            ]
+            if left_sources and right_sources:
+                framing_differences.append(
+                    f"Left-leaning coverage: {', '.join(left_sources)}. "
+                    f"Right-leaning coverage: {', '.join(right_sources)}."
+                )
 
-    def _detect_label_divergence(
-        self, cluster: StoryCluster, signal: BiasSignal
-    ) -> None:
-        """Flag clusters where same real-world entity gets different labels."""
-        LABEL_GROUPS: list[set[str]] = [
-            {"migrants", "illegal immigrants", "undocumented immigrants",
-             "asylum seekers", "illegal aliens", "border crossers"},
-            {"protesters", "rioters", "demonstrators", "mob", "activists"},
-            {"terrorists", "militants", "fighters", "rebels", "insurgents"},
-            {"tax cuts", "tax relief", "tax breaks", "giveaways to the rich"},
-            {"pro-life", "anti-abortion", "abortion opponents", "abortion rights opponents"},
-            {"pro-choice", "abortion rights", "abortion supporters"},
+        cross_source_summary = self._build_summary(cluster, omissions, attribution_asymmetry)
+
+        return FramingResult(
+            cluster_id=cluster.cluster_id,
+            entity_omissions=omissions,
+            framing_differences=framing_differences,
+            attribution_asymmetry=attribution_asymmetry,
+            cross_source_summary=cross_source_summary,
+        )
+
+    def _build_summary(self, cluster: StoryCluster, omissions: list[str], asymmetry: list[str]) -> str:
+        lines = [
+            f"Story: {cluster.representative_headline}",
+            f"Sources ({cluster.source_count}): " +
+            ", ".join(a.raw.source_name for a in cluster.articles),
         ]
-
-        for label_group in LABEL_GROUPS:
-            found_labels: dict[str, str] = {}
-            for article in cluster.articles:
-                text_lower = f"{article.raw.headline} {article.raw.summary}".lower()
-                for label in label_group:
-                    if label in text_lower:
-                        found_labels[article.raw.source_name] = label
-                        break
-
-            if len(set(found_labels.values())) > 1:
-                label_desc = ", ".join(
-                    f"{src}: '{label}'" for src, label in found_labels.items()
-                )
-                signal.escalation_reasons.append(
-                    f"Label divergence detected: {label_desc}"
-                )
-                signal.escalate_to_llm = True
-                break  # One flag per cluster is enough
+        if omissions:
+            lines.append("Entity omissions: " + "; ".join(omissions[:3]))
+        if asymmetry:
+            lines.append("Attribution: " + "; ".join(asymmetry))
+        return "\n".join(lines)

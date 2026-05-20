@@ -1,8 +1,30 @@
+# Ingestion
 httpx>=0.28.0
 feedparser>=6.0.11
 beautifulsoup4>=4.12.3
 lxml>=5.3.0
-PyYAML>=6.0.2
 python-dateutil>=2.9.0
+
+# Config
+PyYAML>=6.0.2
+
+# NLP / Parsing
+spacy>=3.8.0
+# After install run: python -m spacy download en_core_web_sm
+vaderSentiment>=3.3.2
+
+# Clustering / Embeddings
 sentence-transformers>=3.3.1
 torch>=2.5.1
+numpy>=1.26.0
+
+# Scheduling
+APScheduler>=3.10.4
+
+# Delivery
+resend>=2.0.0
+python-telegram-bot>=21.0
+
+# Dev / Testing
+pytest>=8.3.0
+pytest-asyncio>=0.24.0

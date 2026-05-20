@@ -1,25 +1,24 @@
-"""Story clustering: groups ParsedArticles covering the same event.
+"""Story clustering using semantic similarity.
 
-Strategy:
-  1. Encode all article headlines with sentence-transformers.
-  2. Build a cosine similarity matrix.
-  3. Greedy single-pass clustering: each article either joins an existing
-     cluster (if sim >= threshold) or seeds a new one.
-  4. Score each cluster by source count, tier diversity, and recency.
-  5. Return clusters sorted by score descending, ready for bias analysis.
+Groups ParsedArticles covering the same real-world event into StoryCluster
+objects, regardless of source or framing. Each cluster becomes the unit of
+analysis for bias detection and summarization.
 
-Single-pass greedy is fast and deterministic — good enough for ~200 articles.
-If article volume grows significantly, swap for DBSCAN or Agglomerative.
+Approach:
+  1. Encode all article full_text fields with sentence-transformers
+  2. Build a cosine similarity matrix
+  3. Greedily assign articles to clusters using a similarity threshold
+  4. Attach corroboration metadata (how many sources, which tiers, bias spread)
 """
 
 from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Optional
 
-import torch
+import numpy as np
 from sentence_transformers import SentenceTransformer, util
 
 from config.loader import get_settings
@@ -32,168 +31,118 @@ logger = logging.getLogger(__name__)
 class StoryCluster:
     """A group of articles covering the same story across sources."""
     cluster_id: int
-    articles: list[ParsedArticle] = field(default_factory=list)
-    topic: Optional[str] = None          # Majority-vote topic across articles
-    score: float = 0.0                   # Importance score for ranking
-    representative_headline: str = ""    # Headline of the highest-credibility article
+    articles: list[ParsedArticle]
+    topic: str                        # Dominant topic for this cluster
+    tiers: list[str]                  # Which geographic tiers are represented
+    source_count: int = field(init=False)
+    bias_spread: list[str] = field(init=False)  # Unique bias_lean values present
+    earliest_published: Optional[datetime] = field(init=False)
+    importance_score: float = 0.0     # Computed by scorer — higher = more prominent
+    representative_headline: str = field(init=False)
+
+    def __post_init__(self) -> None:
+        self.source_count = len(self.articles)
+        self.bias_spread = list({
+            a.raw.bias_lean for a in self.articles if a.raw.bias_lean != "unknown"
+        })
+        published_dates = [
+            a.raw.published_at for a in self.articles if a.raw.published_at
+        ]
+        self.earliest_published = min(published_dates) if published_dates else None
+        # Use the article from the highest-credibility source as representative
+        credibility_order = {"high": 0, "medium": 1, "low": 2}
+        best = min(
+            self.articles,
+            key=lambda a: credibility_order.get(a.raw.credibility, 2)
+        )
+        self.representative_headline = best.raw.headline
 
     @property
-    def source_names(self) -> list[str]:
-        return [a.raw.source_name for a in self.articles]
+    def has_cross_source_coverage(self) -> bool:
+        return len({a.raw.source_name for a in self.articles}) > 1
 
     @property
-    def regions(self) -> set[str]:
-        return {a.raw.region for a in self.articles}
-
-    @property
-    def bias_leans(self) -> list[str]:
-        return [a.raw.bias_lean for a in self.articles]
-
-    @property
-    def latest_published(self) -> Optional[datetime]:
-        dates = [a.raw.published_at for a in self.articles if a.raw.published_at]
-        return max(dates) if dates else None
-
-    @property
-    def source_count(self) -> int:
-        return len(set(self.source_names))
+    def has_cross_lean_coverage(self) -> bool:
+        """True if cluster includes articles from both left and right outlets."""
+        leans = {a.raw.bias_lean for a in self.articles}
+        has_left = any(l in leans for l in ("left", "center-left"))
+        has_right = any(l in leans for l in ("right", "center-right"))
+        return has_left and has_right
 
 
 class StoryClusterer:
-    """Clusters ParsedArticles into StoryCluster objects."""
+    """Clusters ParsedArticles into StoryCluster objects by semantic similarity."""
 
     def __init__(self) -> None:
         self.settings = get_settings()
-        self._model: Optional[SentenceTransformer] = None
+        self._threshold: float = self.settings["clustering"]["similarity_threshold"]
+        self._model: SentenceTransformer | None = None
 
     def cluster(self, articles: list[ParsedArticle]) -> list[StoryCluster]:
         if not articles:
             return []
 
         model = self._get_model()
-        headlines = [a.raw.headline for a in articles]
+        texts = [a.full_text for a in articles]
+        logger.info("Encoding %d articles for clustering...", len(texts))
+        embeddings = model.encode(texts, convert_to_tensor=True, show_progress_bar=False)
 
-        logger.info("Encoding %d headlines for clustering...", len(headlines))
-        embeddings = model.encode(
-            headlines,
-            convert_to_tensor=True,
-            show_progress_bar=False,
-            batch_size=64,
-        )
-
-        # Store embeddings on articles for later bias analysis
-        for article, emb in zip(articles, embeddings):
-            article.embedding = emb.tolist()
-
-        threshold = self.settings["clustering"]["similarity_threshold"]
-        clusters = self._greedy_cluster(articles, embeddings, threshold)
-
-        # Score and assign topics
-        for cluster in clusters:
-            cluster.topic = self._majority_topic(cluster)
-            cluster.score = self._score_cluster(cluster)
-            cluster.representative_headline = self._best_headline(cluster)
-
-        # Sort by score descending
-        clusters.sort(key=lambda c: c.score, reverse=True)
-        logger.info("Produced %d story clusters from %d articles", len(clusters), len(articles))
-        return clusters
-
-    def _greedy_cluster(
-        self,
-        articles: list[ParsedArticle],
-        embeddings: torch.Tensor,
-        threshold: float,
-    ) -> list[StoryCluster]:
+        # Greedy single-linkage clustering
+        assigned: list[int] = [-1] * len(articles)
         cluster_id = 0
-        clusters: list[StoryCluster] = []
-        # centroid_embeddings[i] = mean embedding of cluster i
-        centroid_embeddings: list[torch.Tensor] = []
 
-        for i, article in enumerate(articles):
-            emb = embeddings[i]
-            best_cluster_idx: Optional[int] = None
-            best_sim = threshold  # Must beat threshold to join
+        for i in range(len(articles)):
+            if assigned[i] != -1:
+                continue
+            assigned[i] = cluster_id
+            for j in range(i + 1, len(articles)):
+                if assigned[j] != -1:
+                    continue
+                sim = float(util.cos_sim(embeddings[i], embeddings[j]))
+                if sim >= self._threshold:
+                    assigned[j] = cluster_id
+            cluster_id += 1
 
-            for j, centroid in enumerate(centroid_embeddings):
-                sim = float(util.cos_sim(emb, centroid))
-                if sim > best_sim:
-                    best_sim = sim
-                    best_cluster_idx = j
+        # Build cluster objects
+        cluster_map: dict[int, list[ParsedArticle]] = {}
+        for article, cid in zip(articles, assigned):
+            cluster_map.setdefault(cid, []).append(article)
 
-            if best_cluster_idx is not None:
-                # Join existing cluster and update centroid
-                clusters[best_cluster_idx].articles.append(article)
-                # Recompute centroid as mean of all member embeddings
-                member_embs = embeddings[
-                    [articles.index(a) for a in clusters[best_cluster_idx].articles]
-                ]
-                centroid_embeddings[best_cluster_idx] = member_embs.mean(dim=0)
-            else:
-                # Seed a new cluster
-                new_cluster = StoryCluster(cluster_id=cluster_id)
-                new_cluster.articles.append(article)
-                clusters.append(new_cluster)
-                centroid_embeddings.append(emb.clone())
-                cluster_id += 1
+        clusters = []
+        for cid, members in cluster_map.items():
+            topic = self._dominant_topic(members)
+            tiers = list({self._tier(a.raw.region) for a in members})
+            cluster = StoryCluster(
+                cluster_id=cid,
+                articles=members,
+                topic=topic,
+                tiers=tiers,
+            )
+            clusters.append(cluster)
 
+        logger.info(
+            "Clustered %d articles into %d story clusters",
+            len(articles), len(clusters)
+        )
         return clusters
 
-    def _majority_topic(self, cluster: StoryCluster) -> str:
-        from collections import Counter
-        topics = [
-            a.detected_topic or (a.raw.topics[0] if a.raw.topics else "current_events")
-            for a in cluster.articles
-        ]
-        return Counter(topics).most_common(1)[0][0]
+    def _dominant_topic(self, articles: list[ParsedArticle]) -> str:
+        topic_counts: dict[str, int] = {}
+        for a in articles:
+            for t in a.detected_topics:
+                topic_counts[t] = topic_counts.get(t, 0) + 1
+        return max(topic_counts, key=topic_counts.get) if topic_counts else "current_events"
 
-    def _score_cluster(self, cluster: StoryCluster) -> float:
-        weights = self.settings["scoring"]["weights"]
-        score = 0.0
-
-        # Source credibility
-        for article in cluster.articles:
-            if article.raw.credibility == "high":
-                score += weights["source_credibility_high"]
-            else:
-                score += weights["source_credibility_medium"]
-
-        # Corroboration bonus (per additional unique source)
-        score += (cluster.source_count - 1) * weights["source_count"]
-
-        # Geographic tier boost
-        regions = cluster.regions
-        if "lee_county_nc" in regions:
-            score *= weights["local_tier"]
-        elif "north_carolina" in regions:
-            score *= weights["state_tier"]
-        else:
-            score *= weights["national_tier"]
-
-        # Recency decay — reduce score by decay_rate per hour of age
-        latest = cluster.latest_published
-        if latest:
-            now = datetime.now(timezone.utc)
-            hours_old = max(0, (now - latest).total_seconds() / 3600)
-            score *= max(0.1, 1.0 - weights["recency_decay"] * hours_old)
-
-        return round(score, 4)
-
-    def _best_headline(self, cluster: StoryCluster) -> str:
-        """Pick headline from highest-credibility, most-recent article."""
-        priority = {"high": 2, "medium": 1}
-        best = max(
-            cluster.articles,
-            key=lambda a: (
-                priority.get(a.raw.credibility, 0),
-                a.raw.published_at or datetime.min.replace(tzinfo=timezone.utc),
-            ),
-        )
-        return best.raw.headline
+    def _tier(self, region: str) -> str:
+        if region == "national":
+            return "national"
+        if region == "north_carolina":
+            return "state"
+        return "local"
 
     def _get_model(self) -> SentenceTransformer:
         if self._model is None:
             model_name = self.settings["clustering"]["model"]
-            logger.info("Loading sentence-transformer: %s", model_name)
+            logger.info("Loading sentence-transformer model: %s", model_name)
             self._model = SentenceTransformer(model_name)
         return self._model
