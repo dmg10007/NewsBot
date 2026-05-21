@@ -6,27 +6,32 @@
 # Reuters dropped public RSS in 2020 — replaced with Google News site: feeds
 # Axios has no native RSS — replaced with Google News site: feed
 # WSJ RSS is paywalled — replaced with Google News site: feed
-# The Hill URL corrected to syndication endpoint
+# AP News feeds moved from feeds.apnews.com/rss/* to hub.apnews.com/...
+# Fox Business moxie.foxnews.com deprecated — replaced with feeds.foxbusiness.com
+# WRAL RSS paths updated to /feed/ format
 
 national:
   rss:
     - name: AP News - Top Headlines
-      url: https://feeds.apnews.com/rss/topnews
+      url: https://rsshub.app/apnews/topics/apf-topnews
       bias_lean: center
       credibility: high
       topics: [politics, economy, current_events]
+      note: "AP News official feeds deprecated; proxied via RSSHub"
 
     - name: AP News - Politics
-      url: https://feeds.apnews.com/rss/politics
+      url: https://rsshub.app/apnews/topics/apf-politics
       bias_lean: center
       credibility: high
       topics: [politics]
+      note: "RSSHub proxy"
 
     - name: AP News - Economy
-      url: https://feeds.apnews.com/rss/business
+      url: https://rsshub.app/apnews/topics/apf-business
       bias_lean: center
       credibility: high
       topics: [economy]
+      note: "RSSHub proxy"
 
     - name: Reuters - Top News
       url: https://news.google.com/rss/search?q=site:reuters.com&hl=en-US&gl=US&ceid=US:en
@@ -87,10 +92,11 @@ national:
       topics: [politics]
 
     - name: Fox News - Economy
-      url: https://moxie.foxnews.com/google-publisher/business.xml
+      url: https://feeds.foxbusiness.com/foxbusiness/latest
       bias_lean: right
       credibility: medium
       topics: [economy]
+      note: "moxie.foxnews.com/google-publisher/business.xml deprecated; moved to foxbusiness feed"
 
     - name: CNN - Politics
       url: http://rss.cnn.com/rss/cnn_allpolitics.rss
@@ -109,18 +115,20 @@ state:
   # North Carolina
   rss:
     - name: WRAL News
-      url: https://www.wral.com/rss/news/
+      url: https://www.wral.com/news/feed/
       bias_lean: center
       credibility: high
       topics: [politics, economy, current_events]
       region: north_carolina
+      note: "Updated from /rss/news/ to /news/feed/"
 
     - name: WRAL Politics
-      url: https://www.wral.com/rss/politics/
+      url: https://www.wral.com/politics/feed/
       bias_lean: center
       credibility: high
       topics: [politics]
       region: north_carolina
+      note: "Updated from /rss/politics/ to /politics/feed/"
 
     - name: NC Policy Watch
       url: http://www.ncpolicywatch.com/feed/
