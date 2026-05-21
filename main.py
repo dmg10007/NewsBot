@@ -1,21 +1,23 @@
-"""Main entry point for running NewsBot ingestion locally.
+"""NewsBot main entry point.
 
-This currently fetches and deduplicates articles from configured sources.
-Future stages will add parsing, clustering, bias detection, summarization,
-and delivery.
+Usage:
+  python main.py                  # Run a single digest immediately (defaults to 'morning')
+  python main.py --period evening  # Run evening digest immediately
+  python main.py --schedule        # Start the scheduler (6 AM / 6 PM ET, blocking)
+  python main.py --test-ingest     # Ingest + dedup only, print article count (no delivery)
 """
 
 from __future__ import annotations
 
+import argparse
 import logging
+from dotenv import load_dotenv
 
-from config.loader import get_sources, get_settings
-from ingestion.deduplicator import Deduplicator
-from ingestion.fetcher import FeedFetcher, RawArticle
-from ingestion.scraper import SCRAPER_REGISTRY
+load_dotenv()
 
 
 def configure_logging() -> None:
+    from config.loader import get_settings
     settings = get_settings()
     logging.basicConfig(
         level=getattr(logging, settings["app"]["log_level"]),
@@ -23,23 +25,61 @@ def configure_logging() -> None:
     )
 
 
-def gather_all_raw_articles() -> list[RawArticle]:
+def main() -> None:
+    configure_logging()
+    parser = argparse.ArgumentParser(description="NewsBot — bias-aware news digest")
+    parser.add_argument(
+        "--period",
+        choices=["morning", "evening"],
+        default="morning",
+        help="Digest period to run (default: morning)",
+    )
+    parser.add_argument(
+        "--schedule",
+        action="store_true",
+        help="Start the blocking scheduler (runs forever at 6 AM/6 PM ET)",
+    )
+    parser.add_argument(
+        "--test-ingest",
+        action="store_true",
+        help="Run ingestion and deduplication only — no delivery",
+    )
+    args = parser.parse_args()
+
+    if args.schedule:
+        from scheduler.scheduler import main as run_scheduler
+        run_scheduler()
+        return
+
+    if args.test_ingest:
+        _run_test_ingest()
+        return
+
+    from scheduler.scheduler import run_digest
+    run_digest(args.period)
+
+
+def _run_test_ingest() -> None:
+    """Ingest + dedup only. Useful for validating sources without triggering delivery."""
+    logger = logging.getLogger(__name__)
+    from config.loader import get_sources
+    from ingestion.fetcher import FeedFetcher
+    from ingestion.scraper import SCRAPER_REGISTRY
+    from ingestion.deduplicator import Deduplicator
+
     sources = get_sources()
     fetcher = FeedFetcher()
-    raw_articles: list[RawArticle] = []
+    raw_articles = []
 
     for tier_name in ("national", "state"):
         tier = sources.get(tier_name, {})
         rss_sources = tier.get("rss", [])
         if rss_sources:
             raw_articles.extend(fetcher.fetch_all(rss_sources))
-
-        scraper_sources = tier.get("scrapers", [])
-        for scraper_source in scraper_sources:
-            scraper_class_name = scraper_source.get("scraper_class")
-            scraper_cls = SCRAPER_REGISTRY.get(scraper_class_name)
-            if scraper_cls:
-                scraper = scraper_cls(scraper_source)
+        for scraper_source in tier.get("scrapers", []):
+            cls = SCRAPER_REGISTRY.get(scraper_source.get("scraper_class", ""))
+            if cls:
+                scraper = cls(scraper_source)
                 try:
                     raw_articles.extend(scraper.scrape())
                 finally:
@@ -47,32 +87,22 @@ def gather_all_raw_articles() -> list[RawArticle]:
 
     local_tier = sources.get("local", {})
     for scraper_source in local_tier.get("scrapers", []):
-        scraper_class_name = scraper_source.get("scraper_class")
-        scraper_cls = SCRAPER_REGISTRY.get(scraper_class_name)
-        if scraper_cls:
-            scraper = scraper_cls(scraper_source)
+        cls = SCRAPER_REGISTRY.get(scraper_source.get("scraper_class", ""))
+        if cls:
+            scraper = cls(scraper_source)
             try:
                 raw_articles.extend(scraper.scrape())
             finally:
                 scraper.close()
 
     fetcher.close()
-    return raw_articles
+    logger.info("Raw articles fetched: %d", len(raw_articles))
 
+    deduped = Deduplicator().deduplicate(raw_articles)
+    logger.info("After deduplication: %d articles", len(deduped))
 
-def main() -> None:
-    configure_logging()
-    logger = logging.getLogger(__name__)
-
-    raw_articles = gather_all_raw_articles()
-    logger.info("Gathered %d raw articles before deduplication", len(raw_articles))
-
-    deduplicator = Deduplicator()
-    deduped = deduplicator.deduplicate(raw_articles)
-    logger.info("Final raw article count after deduplication: %d", len(deduped))
-
-    for article in deduped[:10]:
-        logger.info("[%s] %s — %s", article.region, article.source_name, article.headline)
+    for a in deduped[:15]:
+        logger.info("[%s][%s] %s — %s", a.region, a.topics, a.source_name, a.headline)
 
 
 if __name__ == "__main__":
