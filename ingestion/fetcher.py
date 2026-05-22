@@ -19,17 +19,30 @@ logger = logging.getLogger(__name__)
 
 
 @dataclass
+class BiasMetadata:
+    """Bias and factuality metadata for a source, resolved at ingest time."""
+    bias_lean: str          # left | center-left | center | center-right | right
+    factuality: str         # very-low | low | mixed | mostly-factual | high | very-high
+    confidence: float       # 0.0-1.0 agreement score between AllSides + MBFC
+    allsides_bias: Optional[str] = None
+    mbfc_bias: Optional[str] = None
+    mbfc_factuality: Optional[str] = None
+    notes: list[str] = field(default_factory=list)
+
+
+@dataclass
 class RawArticle:
     """Normalized raw article from any source before NLP processing."""
     url: str
     headline: str
     summary: str
     source_name: str
-    bias_lean: str
+    bias_lean: str          # from sources.yaml (fast path)
     credibility: str
     topics: list[str]
-    region: str  # national | north_carolina | lee_county_nc
+    region: str             # national | north_carolina | lee_county_nc
     published_at: Optional[datetime]
+    bias_metadata: Optional[BiasMetadata] = None  # enriched by BiasResolver
     url_hash: str = field(init=False)
 
     def __post_init__(self) -> None:
@@ -39,7 +52,14 @@ class RawArticle:
 class FeedFetcher:
     """Fetches and parses RSS feeds defined in sources.yaml."""
 
-    def __init__(self) -> None:
+    def __init__(self, bias_resolver=None) -> None:
+        """
+        Args:
+            bias_resolver: Optional BiasResolver instance. If provided, every
+                           RawArticle will have its bias_metadata field populated
+                           from AllSides + MBFC data. If None, bias_metadata is
+                           left as None and bias_lean from sources.yaml is used.
+        """
         self.settings = get_settings()
         self._cache: dict[str, tuple[float, list[RawArticle]]] = {}
         self._client = httpx.Client(
@@ -47,6 +67,7 @@ class FeedFetcher:
             headers={"User-Agent": self.settings["ingestion"]["user_agent"]},
             follow_redirects=True,
         )
+        self._bias_resolver = bias_resolver
 
     def fetch_all(self, sources: list[dict]) -> list[RawArticle]:
         """Fetch all RSS sources, return flat list of RawArticles."""
@@ -112,6 +133,28 @@ class FeedFetcher:
         if hasattr(entry, "published_parsed") and entry.published_parsed:
             published_at = datetime(*entry.published_parsed[:6], tzinfo=timezone.utc)
 
+        # Resolve bias metadata from AllSides + MBFC if resolver is available
+        bias_metadata: Optional[BiasMetadata] = None
+        if self._bias_resolver is not None:
+            try:
+                from urllib.parse import urlparse
+                domain = urlparse(url).netloc
+                rating = self._bias_resolver.resolve(
+                    domain,
+                    credibility=source.get("credibility", "medium"),
+                )
+                bias_metadata = BiasMetadata(
+                    bias_lean=rating.bias_lean,
+                    factuality=rating.factuality,
+                    confidence=rating.confidence,
+                    allsides_bias=rating.allsides_bias,
+                    mbfc_bias=rating.mbfc_bias,
+                    mbfc_factuality=rating.mbfc_factuality,
+                    notes=rating.notes,
+                )
+            except Exception as exc:
+                logger.debug("Bias resolution failed for %s: %s", url, exc)
+
         return RawArticle(
             url=url,
             headline=headline,
@@ -122,6 +165,7 @@ class FeedFetcher:
             topics=source.get("topics", []),
             region=source.get("region", "national"),
             published_at=published_at,
+            bias_metadata=bias_metadata,
         )
 
     def close(self) -> None:
