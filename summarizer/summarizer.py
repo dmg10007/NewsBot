@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import logging
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional
 
 import httpx
@@ -43,6 +43,14 @@ Rules:
 
 
 @dataclass
+class SourceLink:
+    """A single article link with its source label and bias lean."""
+    source_name: str
+    url: str
+    bias_lean: Optional[str] = None  # e.g. "left", "center", "right", "center-left", "center-right"
+
+
+@dataclass
 class SummaryResult:
     cluster_id: int
     summary: str
@@ -53,6 +61,7 @@ class SummaryResult:
     representative_headline: str
     bias_notes: str
     provider_used: str
+    sources: list[SourceLink] = field(default_factory=list)
 
 
 class Summarizer:
@@ -66,6 +75,22 @@ class Summarizer:
     def summarize(self, cluster: StoryCluster, analysis: LLMAnalysisResult) -> SummaryResult:
         facts = analysis.extracted_facts
         bias_notes = analysis.bias_notes
+
+        # Build per-source links, one per unique source (pick first article URL per source).
+        seen_sources: set[str] = set()
+        source_links: list[SourceLink] = []
+        for article in cluster.articles:
+            name = article.raw.source_name
+            url = article.raw.url
+            if name not in seen_sources and url:
+                seen_sources.add(name)
+                bias_lean = getattr(article.raw, "bias_lean", None)
+                source_links.append(SourceLink(
+                    source_name=name,
+                    url=url,
+                    bias_lean=bias_lean,
+                ))
+        source_links.sort(key=lambda s: s.source_name.lower())
 
         # Skip local LLM for single-source stories or clusters with no
         # extracted facts — there is nothing to cross-compare, so the
@@ -87,6 +112,7 @@ class Summarizer:
             representative_headline=cluster.representative_headline,
             bias_notes=bias_notes,
             provider_used=provider,
+            sources=source_links,
         )
 
     def _summarize_from_facts(self, facts: list[str], cluster: StoryCluster) -> str:
@@ -120,17 +146,27 @@ class Summarizer:
         return response.json()["choices"][0]["message"]["content"].strip()
 
     def _fallback_summary(self, cluster: StoryCluster) -> str:
-        sources = ", ".join(
-            sorted({a.raw.source_name for a in cluster.articles})
-        )
+        """Fallback when LLM is unavailable or story is single-source.
+
+        Builds a readable sentence from entities rather than repeating
+        the headline verbatim.
+        """
         entities = list({
             e[0] for a in cluster.articles for e in a.entities
             if e[1] in ("PERSON", "ORG", "GPE", "LOC")
         })[:5]
-        entity_str = f" Key entities: {', '.join(entities)}." if entities else ""
+
+        if entities:
+            entity_str = ", ".join(entities)
+            return (
+                f"Reported by {cluster.source_count} source(s). "
+                f"Key subjects: {entity_str}. "
+                f"Full details available via the source link(s) below."
+            )
+        # Absolute last resort — no entities, no facts
         return (
-            f"{cluster.representative_headline} "
-            f"Reported by {cluster.source_count} source(s): {sources}.{entity_str}"
+            f"Reported by {cluster.source_count} source(s). "
+            f"Full details available via the source link(s) below."
         )
 
     def close(self) -> None:

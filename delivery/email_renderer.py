@@ -6,6 +6,7 @@ Design principles:
   - Scannable: topic sections with clear headers
   - Transparent: source count, tier badges, bias notes visible but unobtrusive
   - Single-source stories are flagged with a low-confidence indicator
+  - Each story shows linked source headlines with bias lean labels
 """
 
 from __future__ import annotations
@@ -27,6 +28,15 @@ TIER_BADGE_COLOR = {
     "national": "#2c7be5",
     "state": "#00897b",
     "local": "#e65100",
+}
+
+# Bias lean -> display label + background color
+_BIAS_TAG: dict[str, tuple[str, str]] = {
+    "left":         ("Left",         "#1565c0"),
+    "center-left":  ("Lean Left",    "#1976d2"),
+    "center":       ("Center",       "#388e3c"),
+    "center-right": ("Lean Right",   "#e64a19"),
+    "right":        ("Right",        "#b71c1c"),
 }
 
 
@@ -92,7 +102,7 @@ def render_digest(summaries: list[SummaryResult], period: DigestPeriod, run_date
                      line-height: 1.3; color: #111; }}
   .story-summary {{ font-size: 14px; color: #333; margin: 0 0 10px 0; line-height: 1.55; }}
   .story-meta {{ font-size: 12px; color: #888; display: flex; flex-wrap: wrap; gap: 8px;
-                 align-items: center; }}
+                 align-items: center; margin-bottom: 10px; }}
   .badge {{ display: inline-block; font-size: 10px; font-weight: 600;
             letter-spacing: 0.5px; text-transform: uppercase; padding: 2px 7px;
             border-radius: 3px; color: #fff; }}
@@ -100,6 +110,16 @@ def render_digest(summaries: list[SummaryResult], period: DigestPeriod, run_date
   .bias-notes {{ font-size: 12px; color: #777; background: #f9f9f7;
                  border-left: 3px solid #ddd; padding: 8px 10px;
                  margin-top: 10px; border-radius: 0 4px 4px 0; font-style: italic; }}
+  .sources-block {{ margin-top: 10px; border-top: 1px solid #f0f0ec; padding-top: 8px; }}
+  .sources-label {{ font-size: 11px; font-weight: 600; letter-spacing: 0.5px;
+                    text-transform: uppercase; color: #aaa; margin-bottom: 5px; }}
+  .source-row {{ font-size: 12px; margin-bottom: 3px; display: flex;
+                 align-items: baseline; gap: 6px; flex-wrap: wrap; }}
+  .source-link {{ color: #2c7be5; text-decoration: none; }}
+  .source-link:hover {{ text-decoration: underline; }}
+  .bias-tag {{ display: inline-block; font-size: 10px; font-weight: 600;
+               letter-spacing: 0.4px; text-transform: uppercase; padding: 1px 5px;
+               border-radius: 2px; color: #fff; vertical-align: middle; }}
   .footer {{ margin-top: 40px; padding-top: 16px; border-top: 1px solid #ddd;
              font-size: 12px; color: #aaa; text-align: center; }}
 </style>
@@ -128,6 +148,36 @@ def _render_section(topic: str, stories: list[SummaryResult]) -> str:
     return f'<div class="section-header">{label}</div>{items}'
 
 
+def _render_bias_tag(bias_lean: str | None) -> str:
+    """Render a colored bias tag span, or empty string if lean is unknown."""
+    if not bias_lean or bias_lean not in _BIAS_TAG:
+        return ''
+    label, color = _BIAS_TAG[bias_lean]
+    return f'<span class="bias-tag" style="background:{color}">{label}</span>'
+
+
+def _render_sources_block(sources) -> str:
+    """Render the per-source linked list with bias tags."""
+    if not sources:
+        return ""
+    rows = ""
+    for src in sources:
+        bias_tag = _render_bias_tag(src.bias_lean)
+        rows += (
+            f'<div class="source-row">'
+            f'<a class="source-link" href="{src.url}" target="_blank">'
+            f'{src.source_name}</a>'
+            f'{bias_tag}'
+            f'</div>'
+        )
+    return (
+        f'<div class="sources-block">'
+        f'<div class="sources-label">Sources</div>'
+        f'{rows}'
+        f'</div>'
+    )
+
+
 def _render_story(s: SummaryResult) -> str:
     tier_badges = "".join(
         f'<span class="badge" style="background:{TIER_BADGE_COLOR.get(t, "#888")}">{t}</span>'
@@ -147,10 +197,13 @@ def _render_story(s: SummaryResult) -> str:
     ):
         bias_block = f'<div class="bias-notes">&#9432; {s.bias_notes}</div>'
 
+    sources_block = _render_sources_block(s.sources)
+
     return f"""
 <div class="story">
   <div class="story-headline">{s.representative_headline}</div>
   <div class="story-summary">{s.summary}</div>
   <div class="story-meta">{tier_badges}{unverified}</div>
+  {sources_block}
   {bias_block}
 </div>"""
