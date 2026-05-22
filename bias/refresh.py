@@ -23,7 +23,7 @@ from pathlib import Path
 import httpx
 
 from bias.source_ratings import (
-    _BROWSER_UA,
+    _BROWSER_HEADERS,
     scrape_allsides,
     scrape_mbfc_bulk,
 )
@@ -40,10 +40,12 @@ CACHE_PATH = Path("config/bias_ratings_cache.json")
 
 def build_cache() -> dict:
     """Scrape all sources and return a serializable ratings dict."""
-    # Use a real browser UA — AllSides and MBFC both block non-browser agents
+    # Full browser header set — AllSides checks Sec-Fetch-* beyond just UA.
+    # Note: scrape_mbfc_bulk delegates to the async path which builds its own
+    # AsyncClient internally; this client is only used for AllSides.
     client = httpx.Client(
         timeout=20,
-        headers={"User-Agent": _BROWSER_UA},
+        headers=_BROWSER_HEADERS,
         follow_redirects=True,
     )
     try:
