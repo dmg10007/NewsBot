@@ -23,6 +23,7 @@ from pathlib import Path
 import httpx
 
 from bias.source_ratings import (
+    _BROWSER_UA,
     scrape_allsides,
     scrape_mbfc_bulk,
 )
@@ -39,9 +40,10 @@ CACHE_PATH = Path("config/bias_ratings_cache.json")
 
 def build_cache() -> dict:
     """Scrape all sources and return a serializable ratings dict."""
+    # Use a real browser UA — AllSides and MBFC both block non-browser agents
     client = httpx.Client(
         timeout=20,
-        headers={"User-Agent": "NewsBot/1.0 (bias-ratings-lookup; educational use)"},
+        headers={"User-Agent": _BROWSER_UA},
         follow_redirects=True,
     )
     try:
@@ -51,8 +53,9 @@ def build_cache() -> dict:
         known_domains = list(
             set(list(allsides.keys()) + list(_FALLBACK_RATINGS.keys()))
         )
-        logger.info("Scraping MBFC for %d domains...", len(known_domains))
-        mbfc = scrape_mbfc_bulk(client, known_domains, delay=1.5)
+        logger.info("Scraping MBFC for %d domains (sequential, 2s delay)...", len(known_domains))
+        # Sequential (max_concurrent=1) with 2s delay — safe for a weekly cron
+        mbfc = scrape_mbfc_bulk(client, known_domains, delay=2.0)
     finally:
         client.close()
 

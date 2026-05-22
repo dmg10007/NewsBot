@@ -5,20 +5,22 @@ Designed to be called once at startup (or weekly via cron) and cached in memory.
 
 No paid API required:
   AllSides  — scrapes public media bias ratings page (single request, sync)
-  MBFC      — scrapes public search results page (async, rate-limited)
+  MBFC      — scrapes public search + detail pages (sequential, rate-limited)
 
-MBFC async design
------------------
-Each domain requires 2 HTTP requests (search + detail page). The original
-synchronous implementation serialised these with a 1.5s sleep between each
-domain, taking 90+ seconds for 30 domains.
+MBFC crawl posture
+------------------
+MBFC is a small WordPress site. We scrape it sequentially (max_concurrent=1)
+with a 2.0s delay between domains for the weekly cron path. The semaphore
+architecture is kept so max_concurrent can be raised if needed, but the
+default is deliberately conservative to avoid 429s.
 
-scrape_mbfc_bulk_async() runs requests concurrently behind an asyncio.Semaphore
-(default max_concurrent=5) with a per-domain minimum delay of 1.0s. For 30
-domains this reduces wall-clock time to ~8s while remaining a polite crawler.
+Each domain requires 2 HTTP requests: search page + detail page.
+For 17 domains at 2.0s delay: ~35s total — acceptable for a weekly job.
 
-The synchronous scrape_mbfc_bulk() wrapper is kept for backwards compatibility
-(tests, one-off CLI use) and delegates to the async version via asyncio.run().
+AllSides anti-bot mitigation
+----------------------------
+AllSides returns 403 for non-browser User-Agents. We use a standard
+browser UA string (_BROWSER_UA) for all outbound requests.
 """
 
 from __future__ import annotations
@@ -34,6 +36,13 @@ import httpx
 from bs4 import BeautifulSoup
 
 logger = logging.getLogger(__name__)
+
+# Standard browser UA — required to avoid AllSides 403 and MBFC bot detection
+_BROWSER_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/124.0.0.0 Safari/537.36"
+)
 
 # ---------------------------------------------------------------------------
 # Data model
@@ -81,9 +90,8 @@ def _normalize_allsides_bias(raw: str) -> Optional[str]:
 def scrape_allsides(client: httpx.Client) -> dict[str, str]:
     """Scrape AllSides media bias ratings page.
 
-    Returns: {domain: normalized_bias_lean}
-    This is a single HTTP request so it stays synchronous.
-    Call via asyncio.to_thread() if you need it inside an async context.
+    The caller must build the httpx.Client with _BROWSER_UA as the
+    User-Agent — AllSides returns 403 for non-browser UAs.
     """
     url = "https://www.allsides.com/media-bias/ratings"
     ratings: dict[str, str] = {}
@@ -199,9 +207,9 @@ _MBFC_FACTUALITY_MAP: dict[str, str] = {
     "very low": "very-low",
 }
 
-_MBFC_HEADERS = {
-    "User-Agent": "NewsBot/1.0 (bias-ratings-lookup; educational use)"
-}
+# Widened selector: MBFC has used h2 and h3 for entry-title across versions.
+# article a is a broad fallback that catches future markup changes.
+_MBFC_RESULT_SELECTOR = "h2.entry-title a, h3.entry-title a, .post-title a, article a"
 
 
 # --- Async implementation ---
@@ -212,8 +220,8 @@ async def scrape_mbfc_source_async(
 ) -> Optional[dict]:
     """Async: scrape MBFC rating for a single domain via their search.
 
-    Returns: {bias: str, factuality: str} or None
-    Two HTTP requests are made: search page, then the first result detail page.
+    Returns: {bias: str, factuality: str} or None.
+    Makes 2 HTTP requests: search page, then first result detail page.
     """
     search_url = f"https://mediabiasfactcheck.com/?s={domain.split('.')[0]}"
     try:
@@ -224,8 +232,14 @@ async def scrape_mbfc_source_async(
         return None
 
     soup = BeautifulSoup(resp.text, "lxml")
-    result = soup.select_one("h2.entry-title a, .post-title a")
+    result = soup.select_one(_MBFC_RESULT_SELECTOR)
     if not result:
+        # Log the first 500 chars of HTML so selector drift is immediately visible
+        logger.debug(
+            "MBFC: no result link found for %s. HTML snippet: %s",
+            domain,
+            resp.text[:500].replace("\n", " "),
+        )
         return None
 
     detail_url = result["href"]
@@ -242,17 +256,14 @@ async def scrape_mbfc_source_async(
 
 async def scrape_mbfc_bulk_async(
     domains: list[str],
-    delay: float = 1.0,
-    max_concurrent: int = 5,
+    delay: float = 2.0,
+    max_concurrent: int = 1,
 ) -> dict[str, dict]:
     """Async: scrape MBFC for a list of domains with concurrency control.
 
-    Runs up to max_concurrent domains in parallel. Each domain still waits
-    at least `delay` seconds (asyncio.sleep — non-blocking) before its
-    requests fire, providing a polite crawl rate.
-
-    Wall-clock time: ~(len(domains) / max_concurrent) * delay + fetch overhead
-    For 30 domains at max_concurrent=5, delay=1.0s: ~8s vs 90s synchronous.
+    Default is max_concurrent=1 (fully sequential) with a 2.0s delay —
+    the safe posture for a weekly cron hitting a small WordPress site.
+    Raise max_concurrent only if you know the target can handle it.
 
     Returns: {domain: {bias, factuality}}
     """
@@ -261,17 +272,17 @@ async def scrape_mbfc_bulk_async(
 
     async def _fetch_one(client: httpx.AsyncClient, domain: str, index: int) -> None:
         async with sem:
-            # Stagger initial requests to avoid burst on first tick
-            await asyncio.sleep(index * (delay / max_concurrent))
+            if index > 0:
+                await asyncio.sleep(delay)
             result = await scrape_mbfc_source_async(client, domain)
             if result:
                 results[domain] = result
-                logger.debug("MBFC: %s -> %s", domain, result)
+                logger.info("MBFC: %s -> %s", domain, result)
             else:
-                logger.debug("MBFC: no result for %s", domain)
+                logger.warning("MBFC: no result for %s", domain)
 
     async with httpx.AsyncClient(
-        headers=_MBFC_HEADERS,
+        headers={"User-Agent": _BROWSER_UA},
         follow_redirects=True,
         timeout=20,
     ) as client:
@@ -290,24 +301,19 @@ def scrape_mbfc_source(
     client: httpx.Client,
     domain: str,
 ) -> Optional[dict]:
-    """Synchronous wrapper around scrape_mbfc_source_async.
-
-    Kept for backwards compatibility and one-off CLI use.
-    For bulk lookups, prefer scrape_mbfc_bulk_async() directly.
-    """
+    """Synchronous wrapper — delegates to scrape_mbfc_bulk_async."""
     return asyncio.run(scrape_mbfc_bulk_async([domain])).get(domain)
 
 
 def scrape_mbfc_bulk(
     client: httpx.Client,
     domains: list[str],
-    delay: float = 1.5,
+    delay: float = 2.0,
 ) -> dict[str, dict]:
-    """Synchronous wrapper around scrape_mbfc_bulk_async.
+    """Synchronous wrapper — delegates to scrape_mbfc_bulk_async.
 
-    Kept for backwards compatibility and one-off CLI use.
-    The `client` and `delay` arguments are accepted but the async version
-    manages its own client internally; `client` is ignored here.
+    `client` is accepted for API compatibility but ignored;
+    the async version manages its own client internally.
     """
     return asyncio.run(scrape_mbfc_bulk_async(domains, delay=delay))
 
