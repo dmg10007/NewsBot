@@ -1,7 +1,7 @@
 """Stage 3 bias detection: LLM-assisted cross-source claim analysis.
 
 Only called for clusters that passed lexicon.py escalation threshold.
-Uses Perplexity Sonar (sonar-reasoning) as primary, with llama.cpp as fallback.
+Uses Perplexity Sonar as primary, with llama.cpp as fallback.
 
 Outputs:
   - A list of factual claims extracted from the cluster
@@ -11,12 +11,18 @@ Outputs:
 
 Design principle: The LLM is a LABELER, not a judge. It identifies and
 names differences; it does not declare which source is correct.
+
+Perplexity model history:
+  sonar-reasoning      -> DEPRECATED (400 Bad Request)
+  sonar                -> Current standard model (used here)
+  sonar-reasoning-pro  -> Higher quality, higher cost alternative
 """
 
 from __future__ import annotations
 
 import logging
 import os
+import re
 from dataclasses import dataclass
 from typing import Optional
 
@@ -28,7 +34,8 @@ from clustering.clusterer import StoryCluster
 logger = logging.getLogger(__name__)
 
 _PPLX_API_URL = "https://api.perplexity.ai/chat/completions"
-_LLAMA_DEFAULT_URL = "http://localhost:8080/v1/chat/completions"
+_PPLX_MODEL = "sonar"  # sonar-reasoning was deprecated; sonar is the current standard model
+_LLAMA_DEFAULT_BASE_URL = "http://localhost:8080"
 
 
 @dataclass
@@ -48,8 +55,13 @@ class LLMAnalyzer:
         self.max_calls = max_calls
         self._calls_made = 0
         self._pplx_key = os.getenv("PPLX_API_KEY", "")
-        self._llama_url = os.getenv("LLAMA_CPP_BASE_URL", _LLAMA_DEFAULT_URL)
         self._llama_model = os.getenv("LLAMA_CPP_MODEL", "llama3")
+
+        # Normalize the base URL: strip trailing slash and any /v1 suffix
+        # so we can always safely append /v1/chat/completions ourselves.
+        raw_base = os.getenv("LLAMA_CPP_BASE_URL", _LLAMA_DEFAULT_BASE_URL)
+        self._llama_base_url = re.sub(r"(/v1)?/?$", "", raw_base.rstrip("/"))
+
         self._client = httpx.Client(timeout=60.0)
 
     def analyze(
@@ -58,7 +70,10 @@ class LLMAnalyzer:
         framing: FramingResult,
     ) -> LLMAnalysisResult:
         if self._calls_made >= self.max_calls:
-            logger.warning("LLM call cap (%d) reached — skipping cluster %d", self.max_calls, cluster.cluster_id)
+            logger.warning(
+                "LLM call cap (%d) reached — skipping cluster %d",
+                self.max_calls, cluster.cluster_id,
+            )
             return LLMAnalysisResult(
                 cluster_id=cluster.cluster_id,
                 extracted_facts=[],
@@ -76,7 +91,10 @@ class LLMAnalyzer:
                 self._calls_made += 1
                 return result
             except Exception as exc:
-                logger.warning("Perplexity call failed for cluster %d: %s. Falling back to local.", cluster.cluster_id, exc)
+                logger.warning(
+                    "Perplexity call failed for cluster %d: %s. Falling back to local.",
+                    cluster.cluster_id, exc,
+                )
 
         try:
             result = self._call_local(cluster.cluster_id, prompt)
@@ -131,7 +149,7 @@ PREVIOUS ANALYSIS CONTEXT:
 
     def _call_perplexity(self, cluster_id: int, prompt: str) -> LLMAnalysisResult:
         payload = {
-            "model": "sonar-reasoning",
+            "model": _PPLX_MODEL,
             "messages": [
                 {"role": "system", "content": "You are a neutral journalism analysis assistant."},
                 {"role": "user", "content": prompt},
@@ -149,7 +167,7 @@ PREVIOUS ANALYSIS CONTEXT:
         )
         response.raise_for_status()
         content = response.json()["choices"][0]["message"]["content"]
-        logger.info("Perplexity analysis complete for cluster %d", cluster_id)
+        logger.info("Perplexity analysis complete for cluster %d (model: %s)", cluster_id, _PPLX_MODEL)
         return self._parse_llm_response(cluster_id, content, "perplexity")
 
     def _call_local(self, cluster_id: int, prompt: str) -> LLMAnalysisResult:
@@ -162,10 +180,8 @@ PREVIOUS ANALYSIS CONTEXT:
             "max_tokens": 600,
             "temperature": 0.1,
         }
-        response = self._client.post(
-            f"{self._llama_url.rstrip('/')}/v1/chat/completions",
-            json=payload,
-        )
+        url = f"{self._llama_base_url}/v1/chat/completions"
+        response = self._client.post(url, json=payload)
         response.raise_for_status()
         content = response.json()["choices"][0]["message"]["content"]
         logger.info("Local LLM analysis complete for cluster %d", cluster_id)
