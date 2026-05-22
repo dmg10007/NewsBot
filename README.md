@@ -7,7 +7,7 @@ Delivers a twice-daily (6 AM / 6 PM ET) email digest with optional Telegram supp
 ## Pipeline
 
 ```
-Sources → Ingest → Deduplicate → Parse/NLP → Cluster → Bias Analysis → Summarize → Deliver
+Sources → Ingest → Deduplicate → Parse/NLP → Cluster → Bias Enrichment → Bias Analysis → Summarize → Deliver
 ```
 
 1. **Ingestion** — RSS feeds + HTML scrapers (national, NC state, Lee County)
@@ -15,9 +15,10 @@ Sources → Ingest → Deduplicate → Parse/NLP → Cluster → Bias Analysis �
 3. **Parsing** — spaCy entity extraction, VADER sentiment, keyword topic classification
 4. **Normalization** — canonical entity aliases across sources
 5. **Clustering** — sentence-transformers cosine similarity grouping
-6. **Bias Analysis** — lexicon scan → framing comparison → Perplexity Sonar (escalation) → llama.cpp fallback
-7. **Summarization** — neutral digest paragraphs via local llama.cpp
-8. **Delivery** — HTML email via Resend, optional Telegram bot
+6. **Bias Enrichment** — domain-level ratings from AllSides + MBFC loaded at startup; every article gets `bias_lean`, `factuality`, and a confidence score before any NLP runs
+7. **Bias Analysis** — lexicon scan → framing comparison → Perplexity Sonar (escalation) → llama.cpp fallback
+8. **Summarization** — neutral digest paragraphs via local llama.cpp
+9. **Delivery** — HTML email via Resend, optional Telegram bot
 
 ## Setup
 
@@ -35,13 +36,28 @@ cp .env.example .env
 # Edit .env — see the Environment Variables section below
 ```
 
-### 3. Start your local llama.cpp server
+### 3. Refresh bias ratings cache
+
+On first run, build the source ratings cache from AllSides and Media Bias Fact Check:
+
+```bash
+python -m bias.refresh
+```
+
+This writes `config/bias_ratings_cache.json` (~2 minutes to complete). It only needs to re-run weekly — add it to cron:
+
+```bash
+# Every Monday at 4 AM
+0 4 * * 1 /path/to/venv/bin/python -m bias.refresh
+```
+
+### 4. Start your local llama.cpp server
 
 ```bash
 ./llama-server -m your-model.gguf --port 8080
 ```
 
-### 4. Run
+### 5. Run
 
 ```bash
 # Test ingestion only (no delivery)
@@ -131,17 +147,58 @@ NEWSBOT_TELEGRAM_CHAT_ID=
 
 | Tier | Sources |
 |---|---|
-| National | AP News, Reuters (via Google News), NPR, PBS NewsHour, Axios (via Google News), The Hill, Fox News, CNN, WSJ (via Google News) |
-| NC State | WRAL, NC Policy Watch, Carolina Public Press, WCNC, Charlotte Observer |
+| National | AP News (via Google News), Reuters (via Google News), NPR, PBS NewsHour, Axios (via Google News), The Hill, Fox News, Fox Business, CNN, WSJ (via Google News) |
+| NC State | WRAL News, WRAL Politics, NC Policy Watch, Carolina Public Press, WCNC, Charlotte Observer (via Google News) |
 | Lee County | Sanford Herald, The Rant NC |
 
-## Bias Detection
+> **Note:** Several outlets (AP News, Reuters, Axios, WSJ, Charlotte Observer) have no public RSS feed or have paywalled/deprecated feeds. These are proxied through Google News `site:` and `allinurl:` search feeds, which return the same articles without requiring a subscription.
 
-Four-stage escalation chain:
-1. Loaded word lexicon scan (always runs)
-2. Sentiment variance across sources (always runs)
-3. Entity omission + framing comparison (on escalated clusters)
-4. Perplexity Sonar `sonar-reasoning` LLM analysis → llama.cpp fallback (on escalated clusters, capped at 20 calls/run)
+## Bias & Factuality System
+
+NewsBot uses a two-layer approach: **source-level ratings** loaded at startup, and **article-level analysis** run during the pipeline.
+
+### Layer 1 — Source Ratings (AllSides + MBFC)
+
+At startup (or after running `python -m bias.refresh`), the bot scrapes two independent third-party rating services:
+
+| Service | What it provides | Methodology |
+|---|---|---|
+| [AllSides](https://www.allsides.com/media-bias/ratings) | Bias lean (Left → Right, 5-point scale) | Editorial review + blind surveys + community feedback |
+| [Media Bias Fact Check](https://mediabiasfactcheck.com) | Bias lean + factuality reporting score | Analyst review of sourcing, headlines, and story selection |
+
+Ratings from both services are **merged per domain** with a confidence score:
+
+| Agreement | Confidence | Outcome |
+|---|---|---|
+| Both agree | `1.0` | High confidence |
+| Off by one step | `0.67` | AllSides used, minor disagreement noted |
+| Differ by 2+ steps | `0.33` | AllSides used, significant disagreement flagged |
+| Only one source | `0.75` | Single-source rating |
+| Neither has data | `0.50` | Hardcoded fallback table |
+
+This mirrors the methodology Ground News uses internally, built from the same primary sources.
+
+Every `RawArticle` carries a `bias_metadata` field after ingestion:
+
+```python
+article.bias_metadata.bias_lean      # 'right'
+article.bias_metadata.factuality     # 'mixed'
+article.bias_metadata.confidence     # 0.67
+article.bias_metadata.allsides_bias  # 'right'
+article.bias_metadata.mbfc_bias      # 'center-right'
+article.bias_metadata.notes          # ['minor disagreement: ...']
+```
+
+The cache refreshes weekly via cron and is stored in `config/bias_ratings_cache.json` (git-ignored).
+
+### Layer 2 — Article-Level Analysis
+
+Four-stage escalation chain run on each story cluster:
+
+1. **Loaded word lexicon scan** — always runs; flags emotionally charged language
+2. **Sentiment variance** — always runs; compares VADER scores across sources covering the same story
+3. **Entity omission + framing comparison** — runs on escalated clusters; detects what facts different sources omit
+4. **LLM analysis** — Perplexity Sonar `sonar-reasoning` → llama.cpp fallback; capped at 20 calls/run
 
 The LLM is a **labeler, not a judge** — it identifies framing differences without declaring which source is correct.
 
