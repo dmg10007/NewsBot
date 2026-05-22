@@ -9,7 +9,7 @@ Design rules:
   - Always note how many sources covered the story
   - Flag if coverage is single-source (lower confidence)
   - If LLM is unavailable, or the story is single-source, fall back to
-    the representative headline + entity list — no local LLM call needed.
+    the RSS description text from the best-credibility article.
     Single-source stories have nothing to cross-compare, so the fallback
     is equally informative at zero cost.
 """
@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -94,7 +95,7 @@ class Summarizer:
 
         # Skip local LLM for single-source stories or clusters with no
         # extracted facts — there is nothing to cross-compare, so the
-        # headline + entity fallback is equally informative at zero cost.
+        # RSS description fallback is equally informative at zero cost.
         if cluster.source_count > 1 and facts:
             summary = self._summarize_from_facts(facts, cluster)
             provider = "local"
@@ -146,28 +147,49 @@ class Summarizer:
         return response.json()["choices"][0]["message"]["content"].strip()
 
     def _fallback_summary(self, cluster: StoryCluster) -> str:
-        """Fallback when LLM is unavailable or story is single-source.
+        """Use the RSS description from the best-credibility article as the summary.
 
-        Builds a readable sentence from entities rather than repeating
-        the headline verbatim.
+        Priority:
+          1. RSS summary text from the highest-credibility article in the cluster,
+             trimmed to 1-2 sentences and stripped of HTML tags.
+          2. RSS summaries from any other article in the cluster.
+          3. Last resort: a sentence built from extracted named entities.
         """
+        credibility_order = {"high": 0, "medium": 1, "low": 2}
+        sorted_articles = sorted(
+            cluster.articles,
+            key=lambda a: credibility_order.get(a.raw.credibility, 2),
+        )
+
+        for article in sorted_articles:
+            raw_summary = article.raw.summary.strip()
+            if not raw_summary:
+                continue
+            cleaned = self._clean_rss_summary(raw_summary)
+            if cleaned:
+                return cleaned
+
+        # Last resort: entity-based sentence
         entities = list({
             e[0] for a in cluster.articles for e in a.entities
             if e[1] in ("PERSON", "ORG", "GPE", "LOC")
         })[:5]
-
         if entities:
-            entity_str = ", ".join(entities)
-            return (
-                f"Reported by {cluster.source_count} source(s). "
-                f"Key subjects: {entity_str}. "
-                f"Full details available via the source link(s) below."
-            )
-        # Absolute last resort — no entities, no facts
-        return (
-            f"Reported by {cluster.source_count} source(s). "
-            f"Full details available via the source link(s) below."
-        )
+            return f"Key subjects: {', '.join(entities)}. Full details available via the source link(s) below."
+        return "Full details available via the source link(s) below."
+
+    @staticmethod
+    def _clean_rss_summary(text: str) -> str:
+        """Strip HTML tags, collapse whitespace, and return at most 2 sentences."""
+        # Remove HTML tags (RSS descriptions often contain <p>, <b>, etc.)
+        text = re.sub(r"<[^>]+>", " ", text)
+        # Collapse whitespace
+        text = re.sub(r"\s+", " ", text).strip()
+        if not text:
+            return ""
+        # Split into sentences and return at most 2
+        sentences = re.split(r"(?<=[.!?])\s+", text)
+        return " ".join(sentences[:2]).strip()
 
     def close(self) -> None:
         self._client.close()
