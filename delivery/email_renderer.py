@@ -30,9 +30,17 @@ TIER_BADGE_COLOR = {
 }
 
 
+def _format_date(dt: datetime) -> str:
+    """Return a date string like 'Friday, May 22, 2026'.
+
+    Uses str(dt.day) instead of %-d so it works on Windows (no GNU strftime).
+    """
+    return dt.strftime("%A, %B ") + str(dt.day) + dt.strftime(", %Y")
+
+
 def render_digest(summaries: list[SummaryResult], period: DigestPeriod, run_date: datetime) -> str:
     """Render a full HTML email digest string."""
-    date_str = run_date.strftime("%A, %B %-d, %Y")
+    date_str = _format_date(run_date)
     period_label = "Morning" if period == "morning" else "Evening"
 
     # Group by topic, respecting max_stories limits set in settings.yaml
