@@ -5,6 +5,15 @@ free tier (3,000 emails/month). The twice-daily digest for ≤5 recipients
 will never exceed this limit.
 
 Docs: https://resend.com/docs/api-reference/emails/send-email
+
+SDK compatibility note
+----------------------
+Resend's Python SDK has two incompatible call signatures across versions:
+  - v0.x / v1.x: resend.Emails.send({"from": ..., "to": ..., ...})  (plain dict)
+  - v2.x+:       resend.Emails.send(SendParams(from_=..., to=..., ...))
+
+We use the plain dict form because it works on both old and new SDK versions.
+The key must be "from" (not "from_") in the dict.
 """
 
 from __future__ import annotations
@@ -65,12 +74,14 @@ class EmailSender:
         subject = subject_template.format(date=_format_date(run_date))
 
         try:
-            params = resend.Emails.SendParams(
-                from_=self._from_addr,
-                to=self._to_addrs,
-                subject=subject,
-                html=html,
-            )
+            # Use plain dict form — compatible with both resend SDK v0/v1 and v2+.
+            # "from" (not "from_") is the required key name in the dict interface.
+            params: dict = {
+                "from": self._from_addr,
+                "to": self._to_addrs,
+                "subject": subject,
+                "html": html,
+            }
             result = resend.Emails.send(params)
             logger.info(
                 "Email sent: id=%s to=%s subject='%s'",
