@@ -23,11 +23,10 @@ from pathlib import Path
 import httpx
 
 from bias.source_ratings import (
-    _FALLBACK_RATINGS,
     scrape_allsides,
     scrape_mbfc_bulk,
 )
-from bias.resolver import _merge_bias, _normalize_domain
+from bias.resolver import _FALLBACK_RATINGS, _merge_bias, _normalize_domain
 
 logging.basicConfig(
     level=logging.INFO,
