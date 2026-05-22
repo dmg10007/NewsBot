@@ -32,6 +32,13 @@ logger = logging.getLogger(__name__)
 
 _LLAMA_DEFAULT_URL = "http://localhost:8080"
 
+# Minimum word count for an RSS summary to be considered useful.
+_MIN_SUMMARY_WORDS = 8
+
+# If this fraction of the summary's words are also in the headline, treat
+# it as a headline echo and discard it.
+_HEADLINE_OVERLAP_THRESHOLD = 0.6
+
 SYSTEM_PROMPT = """You are a neutral news summarizer. Your output will appear in a bias-free daily briefing.
 Rules:
 - Write 2-4 sentences maximum
@@ -150,10 +157,9 @@ class Summarizer:
         """Use the RSS description from the best-credibility article as the summary.
 
         Priority:
-          1. RSS summary text from the highest-credibility article in the cluster,
-             trimmed to 1-2 sentences and stripped of HTML tags.
-          2. RSS summaries from any other article in the cluster.
-          3. Last resort: a sentence built from extracted named entities.
+          1. RSS summary text from articles sorted by credibility, accepting the
+             first one that passes the headline-echo and minimum-length checks.
+          2. Last resort: a sentence built from extracted named entities.
         """
         credibility_order = {"high": 0, "medium": 1, "low": 2}
         sorted_articles = sorted(
@@ -161,13 +167,20 @@ class Summarizer:
             key=lambda a: credibility_order.get(a.raw.credibility, 2),
         )
 
+        headline = cluster.representative_headline
         for article in sorted_articles:
             raw_summary = article.raw.summary.strip()
             if not raw_summary:
                 continue
             cleaned = self._clean_rss_summary(raw_summary)
-            if cleaned:
-                return cleaned
+            if not cleaned:
+                continue
+            if self._is_headline_echo(cleaned, headline):
+                logger.debug(
+                    "Discarding RSS summary (headline echo) for: %s", headline[:60]
+                )
+                continue
+            return cleaned
 
         # Last resort: entity-based sentence
         entities = list({
@@ -180,16 +193,46 @@ class Summarizer:
 
     @staticmethod
     def _clean_rss_summary(text: str) -> str:
-        """Strip HTML tags, collapse whitespace, and return at most 2 sentences."""
-        # Remove HTML tags (RSS descriptions often contain <p>, <b>, etc.)
+        """Strip HTML, remove source-name suffixes, collapse whitespace, cap at 2 sentences.
+
+        Some RSS feeds (Reuters, Axios) set the description field to just
+        "{headline}    {source name}" with no real summary text. We strip
+        trailing chunks that look like bare source attributions (all caps or
+        title-case words after 3+ spaces) before the headline-echo check.
+        """
+        # Remove HTML tags
         text = re.sub(r"<[^>]+>", " ", text)
+        # Strip trailing "   Source Name" patterns (3+ spaces then a short label)
+        text = re.sub(r"\s{3,}[A-Z][^\n]{1,40}$", "", text).strip()
         # Collapse whitespace
         text = re.sub(r"\s+", " ", text).strip()
         if not text:
             return ""
-        # Split into sentences and return at most 2
+        # Cap at 2 sentences
         sentences = re.split(r"(?<=[.!?])\s+", text)
-        return " ".join(sentences[:2]).strip()
+        result = " ".join(sentences[:2]).strip()
+        # Reject if too short to be informative
+        if len(result.split()) < _MIN_SUMMARY_WORDS:
+            return ""
+        return result
+
+    @staticmethod
+    def _is_headline_echo(summary: str, headline: str) -> bool:
+        """Return True if the summary is just a restatement of the headline.
+
+        Computes the fraction of meaningful summary words (4+ chars, alpha)
+        that also appear in the headline. If >= _HEADLINE_OVERLAP_THRESHOLD,
+        the summary adds no new information and should be discarded.
+        """
+        def meaningful_words(s: str) -> set[str]:
+            return {w.lower() for w in re.findall(r"[a-zA-Z]{4,}", s)}
+
+        summary_words = meaningful_words(summary)
+        if not summary_words:
+            return True
+        headline_words = meaningful_words(headline)
+        overlap = summary_words & headline_words
+        return len(overlap) / len(summary_words) >= _HEADLINE_OVERLAP_THRESHOLD
 
     def close(self) -> None:
         self._client.close()
