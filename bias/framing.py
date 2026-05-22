@@ -15,6 +15,7 @@ import logging
 from dataclasses import dataclass
 from collections import Counter
 
+from bias.lexicon import _HEDGE_WORDS
 from clustering.clusterer import StoryCluster
 from parsing.extractor import ParsedArticle
 
@@ -63,7 +64,6 @@ class FramingAnalyzer:
                 )
 
         # Attribution asymmetry: hedge words present in some sources but not others
-        from bias.lexicon import _HEDGE_WORDS
         hedge_by_source: dict[str, bool] = {}
         for article in articles:
             text_lower = article.full_text.lower()

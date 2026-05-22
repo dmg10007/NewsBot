@@ -6,7 +6,7 @@ analysis for bias detection and summarization.
 
 Approach:
   1. Encode all article full_text fields with sentence-transformers
-  2. Build a cosine similarity matrix
+  2. Use util.semantic_search() for batched ANN similarity (O(n) vs O(n²))
   3. Greedily assign articles to clusters using a similarity threshold
   4. Attach corroboration metadata (how many sources, which tiers, bias spread)
 """
@@ -71,7 +71,13 @@ class StoryCluster:
 
 
 class StoryClusterer:
-    """Clusters ParsedArticles into StoryCluster objects by semantic similarity."""
+    """Clusters ParsedArticles into StoryCluster objects by semantic similarity.
+
+    Uses util.semantic_search() for batched approximate nearest-neighbor
+    similarity instead of an O(n²) pairwise loop. For 200 articles the old
+    approach made ~20,000 individual cos_sim() calls; this version computes
+    the same matrix in one vectorized shot.
+    """
 
     def __init__(self) -> None:
         self.settings = get_settings()
@@ -82,12 +88,21 @@ class StoryClusterer:
         if not articles:
             return []
 
+        # Fast path: single article needs no model
+        if len(articles) == 1:
+            return [self._make_cluster(0, articles)]
+
         model = self._get_model()
         texts = [a.full_text for a in articles]
         logger.info("Encoding %d articles for clustering...", len(texts))
         embeddings = model.encode(texts, convert_to_tensor=True, show_progress_bar=False)
 
-        # Greedy single-linkage clustering
+        # Batched ANN: returns top_k most similar articles for every article.
+        # top_k=len(articles) ensures we see all pairs above threshold.
+        top_k = min(len(articles), 50)  # cap at 50 neighbours — sufficient for greedy grouping
+        hits = util.semantic_search(embeddings, embeddings, top_k=top_k)
+
+        # Greedy single-linkage clustering using ANN hits
         assigned: list[int] = [-1] * len(articles)
         cluster_id = 0
 
@@ -95,11 +110,11 @@ class StoryClusterer:
             if assigned[i] != -1:
                 continue
             assigned[i] = cluster_id
-            for j in range(i + 1, len(articles)):
-                if assigned[j] != -1:
+            for hit in hits[i]:
+                j = hit["corpus_id"]
+                if j == i or assigned[j] != -1:
                     continue
-                sim = float(util.cos_sim(embeddings[i], embeddings[j]))
-                if sim >= self._threshold:
+                if hit["score"] >= self._threshold:
                     assigned[j] = cluster_id
             cluster_id += 1
 
@@ -108,23 +123,26 @@ class StoryClusterer:
         for article, cid in zip(articles, assigned):
             cluster_map.setdefault(cid, []).append(article)
 
-        clusters = []
-        for cid, members in cluster_map.items():
-            topic = self._dominant_topic(members)
-            tiers = list({self._tier(a.raw.region) for a in members})
-            cluster = StoryCluster(
-                cluster_id=cid,
-                articles=members,
-                topic=topic,
-                tiers=tiers,
-            )
-            clusters.append(cluster)
+        clusters = [
+            self._make_cluster(cid, members)
+            for cid, members in cluster_map.items()
+        ]
 
         logger.info(
             "Clustered %d articles into %d story clusters",
             len(articles), len(clusters)
         )
         return clusters
+
+    def _make_cluster(self, cid: int, members: list[ParsedArticle]) -> StoryCluster:
+        topic = self._dominant_topic(members)
+        tiers = list({self._tier(a.raw.region) for a in members})
+        return StoryCluster(
+            cluster_id=cid,
+            articles=members,
+            topic=topic,
+            tiers=tiers,
+        )
 
     def _dominant_topic(self, articles: list[ParsedArticle]) -> str:
         topic_counts: dict[str, int] = {}

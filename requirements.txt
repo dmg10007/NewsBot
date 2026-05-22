@@ -16,7 +16,10 @@ vaderSentiment>=3.3.2
 
 # Clustering / Embeddings
 sentence-transformers>=3.3.1
-torch>=2.5.1
+# torch is a transitive dependency of sentence-transformers.
+# Do not pin it here — sentence-transformers manages its own torch
+# constraint, and a direct pin causes version conflicts on CUDA machines
+# where the CUDA-specific torch build is already installed.
 numpy>=1.26.0
 
 # Scheduling

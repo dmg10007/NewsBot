@@ -1,4 +1,14 @@
-"""RSS and API feed fetcher with caching, retry logic, and rate limiting."""
+"""RSS and API feed fetcher with retry logic and rate limiting.
+
+Caching note
+------------
+The instance-level _cache dict only persists for the lifetime of the
+FeedFetcher instance. Because the scheduler creates a new instance on
+every run, cache_ttl_seconds in settings.yaml has no effect across runs.
+The cache is useful only if fetch_all() is called multiple times on the
+same instance within a single run (e.g. during testing). A persistent
+cross-run cache (file-based shelve or Redis) is a future improvement.
+"""
 
 from __future__ import annotations
 
@@ -10,7 +20,6 @@ from datetime import datetime, timezone
 from typing import Optional
 
 import feedparser
-import httpx
 import yaml
 
 from config.loader import get_settings
@@ -50,7 +59,12 @@ class RawArticle:
 
 
 class FeedFetcher:
-    """Fetches and parses RSS feeds defined in sources.yaml."""
+    """Fetches and parses RSS feeds defined in sources.yaml.
+
+    feedparser manages its own HTTP internally, so FeedFetcher does not
+    maintain an httpx client. The optional bias_resolver argument is the
+    only component that makes outbound HTTP calls.
+    """
 
     def __init__(self, bias_resolver=None) -> None:
         """
@@ -62,11 +76,6 @@ class FeedFetcher:
         """
         self.settings = get_settings()
         self._cache: dict[str, tuple[float, list[RawArticle]]] = {}
-        self._client = httpx.Client(
-            timeout=self.settings["ingestion"]["request_timeout_seconds"],
-            headers={"User-Agent": self.settings["ingestion"]["user_agent"]},
-            follow_redirects=True,
-        )
         self._bias_resolver = bias_resolver
 
     def fetch_all(self, sources: list[dict]) -> list[RawArticle]:
@@ -169,4 +178,5 @@ class FeedFetcher:
         )
 
     def close(self) -> None:
-        self._client.close()
+        """No-op. Kept for API compatibility — feedparser manages its own connections."""
+        pass
