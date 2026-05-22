@@ -14,10 +14,10 @@ Sources → Ingest → Deduplicate → Parse/NLP → Cluster → Bias Enrichment
 2. **Deduplication** — URL hash + semantic headline similarity
 3. **Parsing** — spaCy entity extraction, VADER sentiment, keyword topic classification
 4. **Normalization** — canonical entity aliases across sources
-5. **Clustering** — sentence-transformers cosine similarity grouping
-6. **Bias Enrichment** — domain-level ratings from AllSides + MBFC loaded at startup; every article gets `bias_lean`, `factuality`, and a confidence score before any NLP runs
-7. **Bias Analysis** — lexicon scan → framing comparison → Perplexity Sonar (escalation) → llama.cpp fallback
-8. **Summarization** — neutral digest paragraphs via local llama.cpp
+5. **Clustering** — sentence-transformers ANN batch search (`util.semantic_search`) with cosine similarity grouping; single-article fast path skips clustering entirely
+6. **Bias Enrichment** — domain-level ratings from AllSides + MBFC loaded at startup via async scraper; every article gets `bias_lean`, `factuality`, and a confidence score before any NLP runs
+7. **Bias Analysis** — lexicon scan → framing comparison → Perplexity Sonar (escalation, `sonar` model) → llama.cpp fallback
+8. **Summarization** — neutral digest paragraphs via local llama.cpp; single-source stories skip LLM and use a headline + entity fallback directly
 9. **Delivery** — HTML email via Resend, optional Telegram bot
 
 ## Setup
@@ -44,7 +44,7 @@ On first run, build the source ratings cache from AllSides and Media Bias Fact C
 python -m bias.refresh
 ```
 
-This writes `config/bias_ratings_cache.json` (~2 minutes to complete). It only needs to re-run weekly — add it to cron:
+This writes `config/bias_ratings_cache.json`. The scraper runs AllSides and MBFC **concurrently** (up to 5 parallel MBFC requests) and completes in ~10 seconds for the default 30-domain list. It only needs to re-run weekly — add it to cron:
 
 ```bash
 # Every Monday at 4 AM
@@ -191,6 +191,8 @@ article.bias_metadata.notes          # ['minor disagreement: ...']
 
 The cache refreshes weekly via cron and is stored in `config/bias_ratings_cache.json` (git-ignored).
 
+**Async scraper:** The MBFC scraper runs up to 5 concurrent domain lookups behind an `asyncio.Semaphore` with a 1.0s polite delay. AllSides (single request) runs concurrently in a thread via `asyncio.to_thread`. Combined startup time for the default 30-domain list is ~10 seconds, down from 90+ seconds in the original sequential implementation. Synchronous wrappers are kept for backwards compatibility with tests and CLI use.
+
 ### Layer 2 — Article-Level Analysis
 
 Four-stage escalation chain run on each story cluster:
@@ -198,7 +200,7 @@ Four-stage escalation chain run on each story cluster:
 1. **Loaded word lexicon scan** — always runs; flags emotionally charged language
 2. **Sentiment variance** — always runs; compares VADER scores across sources covering the same story
 3. **Entity omission + framing comparison** — runs on escalated clusters; detects what facts different sources omit
-4. **LLM analysis** — Perplexity Sonar `sonar-reasoning` → llama.cpp fallback; capped at 20 calls/run
+4. **LLM analysis** — Perplexity Sonar (`sonar` model) → llama.cpp fallback; capped at 20 calls/run; article summaries truncated to 300 chars per prompt to reduce token usage by ~60%
 
 The LLM is a **labeler, not a judge** — it identifies framing differences without declaring which source is correct.
 
@@ -230,3 +232,20 @@ WantedBy=multi-user.target
 sudo systemctl enable newsbot
 sudo systemctl start newsbot
 ```
+
+## Changelog
+
+### 2026-05-22
+- **perf: async MBFC scraper** — `bias/source_ratings.py` and `bias/resolver.py` refactored to run MBFC domain lookups concurrently (`asyncio.Semaphore`, max 5 parallel). `BiasResolver.refresh_async()` runs AllSides + MBFC via `asyncio.gather`. Startup bias scraping: ~10s vs 90s+ previously. Sync wrappers kept for backwards compatibility.
+
+### 2026-05-21 (patch batch)
+- **fix: scheduler duplicate `load_dotenv`** — removed redundant `load_dotenv()` call and unused import from `scheduler.py`
+- **fix: `bias/resolver.py` import order** — moved `import re` to module top level
+- **fix: deprecated Perplexity model** — `sonar-reasoning` → `sonar` in `config/settings.yaml`
+- **perf: token reduction ~60%** — article summaries truncated to 300 chars in `bias/llm_analyzer.py` LLM prompt
+- **perf: single-source summarizer fast path** — `summarizer/summarizer.py` skips local LLM for single-source stories, uses headline + entity fallback directly
+- **perf: clustering O(n²) → ANN** — `clustering/clusterer.py` replaced pairwise loop with `util.semantic_search()` batched ANN; single-article fast path added
+- **fix: dead httpx.Client removed** — `ingestion/fetcher.py` cleaned up; cache scope documented
+- **fix: `bias/framing.py` import** — `_HEDGE_WORDS` moved to module level
+- **fix: `config/loader.py` lru_cache note** — restart requirement documented
+- **fix: requirements.txt** — direct `torch` pin removed
