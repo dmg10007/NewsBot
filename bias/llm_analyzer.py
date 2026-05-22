@@ -16,6 +16,10 @@ Perplexity model history:
   sonar-reasoning      -> DEPRECATED (400 Bad Request)
   sonar                -> Current standard model (used here)
   sonar-reasoning-pro  -> Higher quality, higher cost alternative
+
+LLM call cap:
+  Default is 50 per run. Override via LLMAnalyzer(max_calls=N) or expose
+  in settings.yaml under bias.max_llm_calls_per_run.
 """
 
 from __future__ import annotations
@@ -36,6 +40,7 @@ logger = logging.getLogger(__name__)
 _PPLX_API_URL = "https://api.perplexity.ai/chat/completions"
 _PPLX_MODEL = "sonar"  # sonar-reasoning was deprecated; sonar is the current standard model
 _LLAMA_DEFAULT_BASE_URL = "http://localhost:8080"
+_DEFAULT_MAX_CALLS = 50  # raised from 20; ~160 clusters typical per morning run
 
 
 @dataclass
@@ -51,7 +56,7 @@ class LLMAnalysisResult:
 class LLMAnalyzer:
     """Calls Perplexity Sonar or local llama.cpp for bias/framing analysis."""
 
-    def __init__(self, max_calls: int = 20) -> None:
+    def __init__(self, max_calls: int = _DEFAULT_MAX_CALLS) -> None:
         self.max_calls = max_calls
         self._calls_made = 0
         self._pplx_key = os.getenv("PPLX_API_KEY", "")
