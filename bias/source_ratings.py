@@ -19,8 +19,8 @@ For 17 domains at 2.0s delay: ~35s total — acceptable for a weekly job.
 
 AllSides anti-bot mitigation
 ----------------------------
-AllSides returns 403 for non-browser User-Agents. We use a standard
-browser UA string (_BROWSER_UA) for all outbound requests.
+AllSides uses Cloudflare bot detection. We send a full browser-like header
+set (UA + Accept + Accept-Language + Sec-Fetch-*) on all outbound requests.
 """
 
 from __future__ import annotations
@@ -37,12 +37,27 @@ from bs4 import BeautifulSoup
 
 logger = logging.getLogger(__name__)
 
-# Standard browser UA — required to avoid AllSides 403 and MBFC bot detection
-_BROWSER_UA = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/124.0.0.0 Safari/537.36"
-)
+# Full browser header set — required to pass Cloudflare / AllSides bot checks.
+# UA alone is insufficient; Sec-Fetch-* and Accept-Language are also checked.
+_BROWSER_HEADERS: dict[str, str] = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Accept": (
+        "text/html,application/xhtml+xml,application/xml;q=0.9,"
+        "image/avif,image/webp,image/apng,*/*;q=0.8"
+    ),
+    "Accept-Language": "en-US,en;q=0.9",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "none",
+    "Sec-Fetch-User": "?1",
+    "Upgrade-Insecure-Requests": "1",
+    "Cache-Control": "max-age=0",
+}
 
 # ---------------------------------------------------------------------------
 # Data model
@@ -90,14 +105,13 @@ def _normalize_allsides_bias(raw: str) -> Optional[str]:
 def scrape_allsides(client: httpx.Client) -> dict[str, str]:
     """Scrape AllSides media bias ratings page.
 
-    The caller must build the httpx.Client with _BROWSER_UA as the
-    User-Agent — AllSides returns 403 for non-browser UAs.
+    Uses a full browser header set (not just UA) to pass Cloudflare checks.
     """
     url = "https://www.allsides.com/media-bias/ratings"
     ratings: dict[str, str] = {}
 
     try:
-        resp = client.get(url, timeout=20)
+        resp = client.get(url, timeout=20, headers=_BROWSER_HEADERS)
         resp.raise_for_status()
     except Exception as exc:
         logger.error("AllSides scrape failed: %s", exc)
@@ -179,6 +193,25 @@ _OUTLET_DOMAIN_MAP: dict[str, str] = {
     "carolina public press": "carolinapublicpress.org",
 }
 
+# Map domain -> preferred MBFC search term when the domain slug gives bad results.
+# MBFC's search is fuzzy; some outlets only surface correctly under their full name.
+_MBFC_SEARCH_MAP: dict[str, str] = {
+    "apnews.com": "associated press",
+    "wsj.com": "wall street journal",
+    "pbs.org": "pbs newshour",
+    "foxnews.com": "fox news",
+    "foxbusiness.com": "fox business",
+    "cnn.com": "cnn",
+    "npr.org": "npr",
+    "thehill.com": "the hill",
+    "axios.com": "axios",
+    "wcnc.com": "wcnc charlotte",
+    "charlotteobserver.com": "charlotte observer",
+    "ncpolicywatch.com": "nc policy watch",
+    "carolinapublicpress.org": "carolina public press",
+    "rantnc.com": "rant nc",
+}
+
 
 # ---------------------------------------------------------------------------
 # MBFC scrapers
@@ -207,9 +240,18 @@ _MBFC_FACTUALITY_MAP: dict[str, str] = {
     "very low": "very-low",
 }
 
-# Widened selector: MBFC has used h2 and h3 for entry-title across versions.
-# article a is a broad fallback that catches future markup changes.
-_MBFC_RESULT_SELECTOR = "h2.entry-title a, h3.entry-title a, .post-title a, article a"
+# A profile URL has exactly one path segment (the slug), e.g.:
+#   mediabiasfactcheck.com/reuters/         -> GOOD
+#   mediabiasfactcheck.com/left/cnn-bias/   -> BAD (sub-directory)
+#   mediabiasfactcheck.com/2017/02/26/...   -> BAD (date-based article)
+_MBFC_PROFILE_RE = re.compile(
+    r"https?://mediabiasfactcheck\.com/([^/]+)/$"
+)
+
+
+def _is_mbfc_profile_url(url: str) -> bool:
+    """Return True only for source-profile URLs (single slug, no sub-paths)."""
+    return bool(_MBFC_PROFILE_RE.match(url))
 
 
 # --- Async implementation ---
@@ -221,9 +263,11 @@ async def scrape_mbfc_source_async(
     """Async: scrape MBFC rating for a single domain via their search.
 
     Returns: {bias: str, factuality: str} or None.
-    Makes 2 HTTP requests: search page, then first result detail page.
+    Makes 2 HTTP requests: search page, then first *profile* result page.
     """
-    search_url = f"https://mediabiasfactcheck.com/?s={domain.split('.')[0]}"
+    search_term = _MBFC_SEARCH_MAP.get(domain, domain.split(".")[0])
+    search_url = f"https://mediabiasfactcheck.com/?s={search_term.replace(' ', '+')}"
+
     try:
         resp = await client.get(search_url, timeout=15)
         resp.raise_for_status()
@@ -232,17 +276,25 @@ async def scrape_mbfc_source_async(
         return None
 
     soup = BeautifulSoup(resp.text, "lxml")
-    result = soup.select_one(_MBFC_RESULT_SELECTOR)
-    if not result:
-        # Log the first 500 chars of HTML so selector drift is immediately visible
+
+    # Walk all article links and pick the first that looks like a source profile.
+    detail_url: Optional[str] = None
+    for a in soup.select("h2.entry-title a, h3.entry-title a, .post-title a, article a"):
+        href = a.get("href", "")
+        if _is_mbfc_profile_url(href):
+            detail_url = href
+            break
+
+    if not detail_url:
         logger.debug(
-            "MBFC: no result link found for %s. HTML snippet: %s",
+            "MBFC: no profile link found for %s (search_term=%r). HTML snippet: %s",
             domain,
-            resp.text[:500].replace("\n", " "),
+            search_term,
+            resp.text[:600].replace("\n", " "),
         )
+        logger.warning("MBFC: no result for %s", domain)
         return None
 
-    detail_url = result["href"]
     try:
         detail_resp = await client.get(detail_url, timeout=15)
         detail_resp.raise_for_status()
@@ -251,7 +303,7 @@ async def scrape_mbfc_source_async(
         return None
 
     detail_soup = BeautifulSoup(detail_resp.text, "lxml")
-    return _parse_mbfc_detail(detail_soup)
+    return _parse_mbfc_detail(detail_soup, domain)
 
 
 async def scrape_mbfc_bulk_async(
@@ -282,7 +334,7 @@ async def scrape_mbfc_bulk_async(
                 logger.warning("MBFC: no result for %s", domain)
 
     async with httpx.AsyncClient(
-        headers={"User-Agent": _BROWSER_UA},
+        headers=_BROWSER_HEADERS,
         follow_redirects=True,
         timeout=20,
     ) as client:
@@ -322,29 +374,69 @@ def scrape_mbfc_bulk(
 # MBFC detail page parser (shared by sync and async paths)
 # ---------------------------------------------------------------------------
 
-def _parse_mbfc_detail(soup: BeautifulSoup) -> Optional[dict]:
-    """Extract bias and factuality from an MBFC detail page."""
-    text = soup.get_text(separator=" ", strip=True).lower()
+def _parse_mbfc_detail(soup: BeautifulSoup, domain: str = "") -> Optional[dict]:
+    """Extract bias and factuality from an MBFC detail page.
 
-    bias = None
-    factuality = None
+    MBFC formats the Detailed Report block as a <p> or <li> containing lines like:
+        Bias Rating: LEAST BIASED (-0.5)
+        Factual Reporting: VERY HIGH (0.0)
 
-    bias_match = re.search(
-        r"bias(?:\s+rating)?[:\s]+([a-z\s\-]+?)(?:[\|\n\r]|factual)",
-        text,
-    )
-    if bias_match:
-        raw = bias_match.group(1).strip().rstrip("-")
-        bias = _MBFC_BIAS_MAP.get(raw)
+    We locate the element containing 'Bias Rating:' and parse from its text
+    rather than running a regex over the entire page (which previously matched
+    comment section text and failed on bold markers).
+    """
+    bias: Optional[str] = None
+    factuality: Optional[str] = None
 
-    fact_match = re.search(
-        r"factual\s+reporting[:\s]+([a-z\s]+?)(?:[\|\n\r]|country|world|press)",
-        text,
-    )
-    if fact_match:
-        raw = fact_match.group(1).strip()
-        factuality = _MBFC_FACTUALITY_MAP.get(raw)
+    # Strategy 1: find the structured "Detailed Report" block.
+    # MBFC wraps it in a <p> or <li> that contains both labels.
+    for tag in soup.find_all(["p", "li", "div"]):
+        text = tag.get_text(separator=" ", strip=True)
+        if "Bias Rating:" not in text and "bias rating:" not in text.lower():
+            continue
+
+        # Extract bias from this block
+        b_match = re.search(
+            r"[Bb]ias\s+[Rr]ating\s*:\s*\**([A-Z][A-Z\s\-]+?)\**\s*(?:\(|[A-Z]{2,}|\n|$)",
+            text,
+        )
+        if b_match:
+            raw_bias = b_match.group(1).strip().rstrip("-").lower()
+            bias = _MBFC_BIAS_MAP.get(raw_bias)
+
+        # Extract factuality from the same block or the next sibling
+        f_match = re.search(
+            r"[Ff]actual\s+[Rr]eporting\s*:\s*\**([A-Z][A-Z\s]+?)\**\s*(?:\(|[A-Z]{2,}|\n|$)",
+            text,
+        )
+        if f_match:
+            raw_fact = f_match.group(1).strip().lower()
+            factuality = _MBFC_FACTUALITY_MAP.get(raw_fact)
+
+        if bias or factuality:
+            break
+
+    # Strategy 2: fallback — scan the full page text with relaxed patterns.
+    # Handles pages where the report block uses unusual markup.
+    if not bias and not factuality:
+        full_text = soup.get_text(separator="\n", strip=True)
+
+        b_match = re.search(
+            r"[Bb]ias\s+[Rr]ating\s*[:\-]\s*([A-Za-z][A-Za-z\s\-]+?)(?:\s*\(|\s*\n|\s{3,})",
+            full_text,
+        )
+        if b_match:
+            bias = _MBFC_BIAS_MAP.get(b_match.group(1).strip().lower())
+
+        f_match = re.search(
+            r"[Ff]actual\s+[Rr]eporting\s*[:\-]\s*([A-Za-z][A-Za-z\s]+?)(?:\s*\(|\s*\n|\s{3,})",
+            full_text,
+        )
+        if f_match:
+            factuality = _MBFC_FACTUALITY_MAP.get(f_match.group(1).strip().lower())
 
     if not bias and not factuality:
+        logger.debug("MBFC: detail parser found nothing for %s", domain)
         return None
+
     return {"bias": bias, "factuality": factuality}
