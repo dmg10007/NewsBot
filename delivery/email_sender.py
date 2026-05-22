@@ -23,6 +23,15 @@ logger = logging.getLogger(__name__)
 DigestPeriod = Literal["morning", "evening"]
 
 
+def _format_date(dt: datetime) -> str:
+    """Return a date string like 'May 22, 2026' without a leading zero on the day.
+
+    strftime's %-d (no-pad day) is Linux-only; %#d is Windows-only.
+    Stripping the leading zero from %d is portable across all platforms.
+    """
+    return dt.strftime("%B %d, %Y").replace(" 0", " ")
+
+
 class EmailSender:
     def __init__(self) -> None:
         self.settings = get_settings()
@@ -53,7 +62,7 @@ class EmailSender:
             if period == "morning"
             else delivery_cfg["subject_evening"]
         )
-        subject = subject_template.format(date=run_date.strftime("%B %-d, %Y"))
+        subject = subject_template.format(date=_format_date(run_date))
 
         try:
             params = resend.Emails.SendParams(
