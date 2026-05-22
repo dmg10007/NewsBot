@@ -23,6 +23,7 @@ The lookup table is refreshed via refresh() which should be called weekly.
 from __future__ import annotations
 
 import logging
+import re
 import threading
 from typing import Optional
 
@@ -180,7 +181,6 @@ class BiasResolver:
 
 def _normalize_domain(domain: str) -> str:
     """Strip scheme, www, and path to get bare domain."""
-    import re
     domain = re.sub(r"^https?://", "", domain)
     domain = re.sub(r"^www\.", "", domain)
     domain = domain.split("/")[0].lower().strip()

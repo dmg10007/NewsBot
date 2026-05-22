@@ -55,7 +55,7 @@ bias_detection:
   always_run_sentiment: true
   llm_escalation_threshold: 0.35   # Escalate if sentiment variance > this across sources
   llm_provider: perplexity          # perplexity | local
-  llm_model: sonar-reasoning
+  llm_model: sonar                  # Current Perplexity model. sonar-reasoning was deprecated (HTTP 400).
   llm_fallback: local               # Falls back to llama.cpp if perplexity unavailable
   llm_fallback_model: llama3        # Model name in your llama.cpp instance
   max_llm_calls_per_run: 20         # Hard cap to control API costs
@@ -79,10 +79,10 @@ delivery:
 scoring:
   # Story importance weights — used to rank within topic buckets
   weights:
-    source_credibility_high: 1.0
-    source_credibility_medium: 0.7
     source_count: 0.3       # Per additional corroborating source
     local_tier: 1.5         # Local stories boosted
     state_tier: 1.2
     national_tier: 1.0
     recency_decay: 0.05     # Score reduction per hour of age
+  # Note: source_credibility weighting is handled inline in scheduler.py
+  # via a hardcoded map {high: 1.0, medium: 0.7, low: 0.4}

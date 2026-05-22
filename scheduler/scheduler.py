@@ -6,6 +6,11 @@ The scheduler is blocking and designed to run as a long-lived process
 
 Timezone handling: APScheduler CronTrigger accepts a pytz timezone string.
 Using 'America/New_York' handles EDT/EST transitions automatically.
+
+Note: .env loading is the responsibility of the entry point (main.py).
+This module does NOT call load_dotenv() — doing so here would load the file
+a second time when invoked through main.py, and would silently skip env vars
+already set if run standalone after the environment was mutated.
 """
 
 from __future__ import annotations
@@ -17,9 +22,6 @@ from datetime import datetime
 
 from apscheduler.schedulers.blocking import BlockingScheduler
 from apscheduler.triggers.cron import CronTrigger
-from dotenv import load_dotenv
-
-load_dotenv()
 
 logger = logging.getLogger(__name__)
 
@@ -35,7 +37,7 @@ def run_digest(period: str) -> None:
     from parsing.normalizer import Normalizer
     from clustering.clusterer import StoryClusterer
     from bias.lexicon import LexiconAnalyzer
-    from bias.framing import FramingAnalyzer
+    from bias.framing import FramingAnalyzer, FramingResult
     from bias.llm_analyzer import LLMAnalyzer, LLMAnalysisResult
     from summarizer.summarizer import Summarizer
     from delivery.email_renderer import render_digest
@@ -141,15 +143,15 @@ def run_digest(period: str) -> None:
             framing_result = framing_analyzer.analyze(cluster)
             analysis = llm_analyzer.analyze(cluster, framing_result)
         else:
-            from bias.framing import FramingResult
-            empty_framing = FramingResult(
+            # Skip LLM entirely for non-escalated clusters — no API cost.
+            analysis = LLMAnalysisResult(
                 cluster_id=cluster.cluster_id,
-                entity_omissions=[],
-                framing_differences=[],
-                attribution_asymmetry=[],
-                cross_source_summary="",
+                extracted_facts=[],
+                framing_notes=[],
+                bias_notes="No significant framing differences detected.",
+                provider_used="none",
+                skipped=False,
             )
-            analysis = llm_analyzer.analyze(cluster, empty_framing)
         analysis_map[cluster.cluster_id] = analysis
 
     llm_analyzer.close()
