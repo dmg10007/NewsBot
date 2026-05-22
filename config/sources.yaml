@@ -6,32 +6,33 @@
 # Reuters dropped public RSS in 2020 — replaced with Google News site: feeds
 # Axios has no native RSS — replaced with Google News site: feed
 # WSJ RSS is paywalled — replaced with Google News site: feed
-# AP News feeds moved from feeds.apnews.com/rss/* to hub.apnews.com/...
+# AP News has no public RSS — replaced with Google News allinurl: proxy
 # Fox Business moxie.foxnews.com deprecated — replaced with feeds.foxbusiness.com
-# WRAL RSS paths updated to /feed/ format
+# WRAL RSS paths from official WRAL RSS page (wral.com/about/wral-rss-feeds/)
+# Charlotte Observer widget RSS dead — replaced with Google News proxy
 
 national:
   rss:
     - name: AP News - Top Headlines
-      url: https://rsshub.app/apnews/topics/apf-topnews
+      url: https://news.google.com/rss/search?q=when:24h+allinurl:apnews.com&hl=en-US&gl=US&ceid=US:en
       bias_lean: center
       credibility: high
       topics: [politics, economy, current_events]
-      note: "AP News official feeds deprecated; proxied via RSSHub"
+      note: "AP News has no public RSS; proxied via Google News allinurl filter"
 
     - name: AP News - Politics
-      url: https://rsshub.app/apnews/topics/apf-politics
+      url: https://news.google.com/rss/search?q=when:24h+allinurl:apnews.com+politics&hl=en-US&gl=US&ceid=US:en
       bias_lean: center
       credibility: high
       topics: [politics]
-      note: "RSSHub proxy"
+      note: "Google News proxy"
 
     - name: AP News - Economy
-      url: https://rsshub.app/apnews/topics/apf-business
+      url: https://news.google.com/rss/search?q=when:24h+allinurl:apnews.com+business+economy&hl=en-US&gl=US&ceid=US:en
       bias_lean: center
       credibility: high
       topics: [economy]
-      note: "RSSHub proxy"
+      note: "Google News proxy"
 
     - name: Reuters - Top News
       url: https://news.google.com/rss/search?q=site:reuters.com&hl=en-US&gl=US&ceid=US:en
@@ -115,20 +116,20 @@ state:
   # North Carolina
   rss:
     - name: WRAL News
-      url: https://www.wral.com/news/feed/
+      url: http://www.wral.com/news/rss/48/
       bias_lean: center
       credibility: high
       topics: [politics, economy, current_events]
       region: north_carolina
-      note: "Updated from /rss/news/ to /news/feed/"
+      note: "Confirmed URL from wral.com/about/wral-rss-feeds/ (Top Stories)"
 
     - name: WRAL Politics
-      url: https://www.wral.com/politics/feed/
+      url: http://www.wral.com/news/rss/35/
       bias_lean: center
       credibility: high
       topics: [politics]
       region: north_carolina
-      note: "Updated from /rss/politics/ to /politics/feed/"
+      note: "Confirmed URL from wral.com/about/wral-rss-feeds/ (Political News)"
 
     - name: NC Policy Watch
       url: http://www.ncpolicywatch.com/feed/
@@ -154,12 +155,13 @@ state:
   scrapers:
     - name: Charlotte Observer
       url: https://www.charlotteobserver.com
-      rss_url: https://www.charlotteobserver.com/news/?widgetName=rssfeed&widgetContentId=712015&getXmlFeed=true
+      rss_url: https://news.google.com/rss/search?q=site:charlotteobserver.com&hl=en-US&gl=US&ceid=US:en
       bias_lean: center-left
       credibility: high
       topics: [politics, economy, current_events]
       region: north_carolina
       scraper_class: CharlotteObserverScraper
+      note: "Legacy widget RSS dead; proxied via Google News"
 
 local:
   # Lee County, NC
