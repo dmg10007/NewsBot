@@ -8,7 +8,10 @@ Design rules:
   - Never editorialize or infer intent
   - Always note how many sources covered the story
   - Flag if coverage is single-source (lower confidence)
-  - If LLM is unavailable, fall back to the representative headline + entity list
+  - If LLM is unavailable, or the story is single-source, fall back to
+    the representative headline + entity list — no local LLM call needed.
+    Single-source stories have nothing to cross-compare, so the fallback
+    is equally informative at zero cost.
 """
 
 from __future__ import annotations
@@ -64,11 +67,13 @@ class Summarizer:
         facts = analysis.extracted_facts
         bias_notes = analysis.bias_notes
 
-        if facts:
+        # Skip local LLM for single-source stories or clusters with no
+        # extracted facts — there is nothing to cross-compare, so the
+        # headline + entity fallback is equally informative at zero cost.
+        if cluster.source_count > 1 and facts:
             summary = self._summarize_from_facts(facts, cluster)
             provider = "local"
         else:
-            # Fallback: headline + entity list, no LLM needed
             summary = self._fallback_summary(cluster)
             provider = "fallback"
 

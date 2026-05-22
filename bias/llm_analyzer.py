@@ -20,6 +20,12 @@ Perplexity model history:
 LLM call cap:
   Default is 50 per run. Override via LLMAnalyzer(max_calls=N) or expose
   in settings.yaml under bias.max_llm_calls_per_run.
+
+Prompt token budget:
+  Article summaries are truncated to _SUMMARY_PREVIEW_CHARS (300) in the
+  prompt. This keeps input tokens reasonable: a 10-article cluster costs
+  ~1,800 input tokens instead of ~5,000+ with full summaries, while still
+  giving the model sufficient context for framing analysis.
 """
 
 from __future__ import annotations
@@ -40,7 +46,8 @@ logger = logging.getLogger(__name__)
 _PPLX_API_URL = "https://api.perplexity.ai/chat/completions"
 _PPLX_MODEL = "sonar"  # sonar-reasoning was deprecated; sonar is the current standard model
 _LLAMA_DEFAULT_BASE_URL = "http://localhost:8080"
-_DEFAULT_MAX_CALLS = 50  # raised from 20; ~160 clusters typical per morning run
+_DEFAULT_MAX_CALLS = 50
+_SUMMARY_PREVIEW_CHARS = 300  # Max chars per article summary in prompt — controls input token cost
 
 
 @dataclass
@@ -116,10 +123,15 @@ class LLMAnalyzer:
             )
 
     def _build_prompt(self, cluster: StoryCluster, framing: FramingResult) -> str:
+        """Build the analysis prompt.
+
+        Article summaries are truncated to _SUMMARY_PREVIEW_CHARS to keep
+        input token usage predictable. Headlines are never truncated.
+        """
         articles_text = "\n\n".join(
             f"SOURCE: {a.raw.source_name} (lean: {a.raw.bias_lean})\n"
             f"HEADLINE: {a.raw.headline}\n"
-            f"SUMMARY: {a.raw.summary}"
+            f"SUMMARY: {(a.raw.summary or '')[:_SUMMARY_PREVIEW_CHARS]}"
             for a in cluster.articles
         )
         return f"""You are a neutral fact-extraction assistant. Your job is to analyze how multiple news sources cover the same story and identify:
