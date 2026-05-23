@@ -12,6 +12,12 @@ Outputs:
 Design principle: The LLM is a LABELER, not a judge. It identifies and
 names differences; it does not declare which source is correct.
 
+Prompt design: source names and bias-lean labels are intentionally excluded
+from the prompt. Providing that metadata primes the LLM to reason about a
+source's political identity rather than the actual content, which works
+against the goal of neutral framing analysis. The LLM sees only anonymized
+ARTICLE_N labels, headlines, and summaries.
+
 Perplexity model history:
   sonar-reasoning      -> DEPRECATED (400 Bad Request)
   sonar                -> Current standard model (used here)
@@ -26,6 +32,11 @@ Prompt token budget:
   prompt. This keeps input tokens reasonable: a 10-article cluster costs
   ~1,800 input tokens instead of ~5,000+ with full summaries, while still
   giving the model sufficient context for framing analysis.
+
+Security note:
+  The httpx client uses a request hook to redact the Authorization header
+  value before it can appear in any log output, preventing accidental key
+  exposure in debug-level httpx logs.
 """
 
 from __future__ import annotations
@@ -48,6 +59,19 @@ _PPLX_MODEL = "sonar"  # sonar-reasoning was deprecated; sonar is the current st
 _LLAMA_DEFAULT_BASE_URL = "http://localhost:8080"
 _DEFAULT_MAX_CALLS = 50
 _SUMMARY_PREVIEW_CHARS = 300  # Max chars per article summary in prompt — controls input token cost
+
+
+def _mask_auth_header(request: httpx.Request) -> None:
+    """httpx request hook: redact Authorization header value in any log output.
+
+    httpx can log full request details at DEBUG level, which would expose
+    the Bearer token. This hook replaces the value with a fixed placeholder
+    so the key never appears in logs regardless of the log level in use.
+    """
+    if "authorization" in request.headers:
+        # headers are case-insensitive but the assignment must use the exact
+        # key format that httpx stores internally.
+        request.headers["authorization"] = "Bearer [REDACTED]"
 
 
 @dataclass
@@ -74,7 +98,12 @@ class LLMAnalyzer:
         raw_base = os.getenv("LLAMA_CPP_BASE_URL", _LLAMA_DEFAULT_BASE_URL)
         self._llama_base_url = re.sub(r"(/v1)?/?$", "", raw_base.rstrip("/"))
 
-        self._client = httpx.Client(timeout=60.0)
+        # event_hooks ensure the Authorization header is redacted before httpx
+        # can include it in any debug-level log output.
+        self._client = httpx.Client(
+            timeout=60.0,
+            event_hooks={"request": [_mask_auth_header]},
+        )
 
     def analyze(
         self,
@@ -125,14 +154,19 @@ class LLMAnalyzer:
     def _build_prompt(self, cluster: StoryCluster, framing: FramingResult) -> str:
         """Build the analysis prompt.
 
+        Source names and bias-lean labels are intentionally excluded.
+        Providing them primes the LLM to reason about a source's political
+        identity rather than the actual content. Articles are labelled
+        ARTICLE_1, ARTICLE_2, etc. only.
+
         Article summaries are truncated to _SUMMARY_PREVIEW_CHARS to keep
         input token usage predictable. Headlines are never truncated.
         """
         articles_text = "\n\n".join(
-            f"SOURCE: {a.raw.source_name} (lean: {a.raw.bias_lean})\n"
+            f"ARTICLE_{idx + 1}\n"
             f"HEADLINE: {a.raw.headline}\n"
             f"SUMMARY: {(a.raw.summary or '')[:_SUMMARY_PREVIEW_CHARS]}"
-            for a in cluster.articles
+            for idx, a in enumerate(cluster.articles)
         )
         return f"""You are a neutral fact-extraction assistant. Your job is to analyze how multiple news sources cover the same story and identify:
 1. The core verifiable factual claims present across sources
@@ -143,6 +177,7 @@ Rules:
 - Do not introduce your own political lean
 - Distinguish between verified facts and attributed claims
 - Use plain language
+- Do not use source outlet names or political labels in your analysis
 - Return your response in this exact format:
 
 FACTS:
@@ -204,34 +239,44 @@ PREVIOUS ANALYSIS CONTEXT:
         logger.info("Local LLM analysis complete for cluster %d", cluster_id)
         return self._parse_llm_response(cluster_id, content, "local")
 
-    def _parse_llm_response(self, cluster_id: int, content: str, provider: str) -> LLMAnalysisResult:
+    def _parse_llm_response(
+        self, cluster_id: int, content: str, provider: str
+    ) -> LLMAnalysisResult:
+        """Parse structured LLM output into an LLMAnalysisResult."""
         facts: list[str] = []
         framing_notes: list[str] = []
         bias_notes = ""
 
-        section = None
-        for line in content.splitlines():
-            line = line.strip()
-            if line.upper().startswith("FACTS:"):
-                section = "facts"
-            elif line.upper().startswith("FRAMING:"):
-                section = "framing"
-            elif line.upper().startswith("BIAS NOTES:"):
-                section = "bias"
-            elif line.startswith("-") and section == "facts":
-                facts.append(line[1:].strip())
-            elif line.startswith("-") and section == "framing":
-                framing_notes.append(line[1:].strip())
-            elif section == "bias" and line:
-                bias_notes += (" " + line) if bias_notes else line
+        facts_match = re.search(r"FACTS:\s*(.+?)(?=FRAMING:|BIAS NOTES:|$)", content, re.DOTALL)
+        framing_match = re.search(r"FRAMING:\s*(.+?)(?=BIAS NOTES:|$)", content, re.DOTALL)
+        bias_match = re.search(r"BIAS NOTES:\s*(.+?)$", content, re.DOTALL)
+
+        if facts_match:
+            facts = [
+                line.lstrip("- ").strip()
+                for line in facts_match.group(1).strip().splitlines()
+                if line.strip() and line.strip() != "-"
+            ]
+        if framing_match:
+            framing_notes = [
+                line.lstrip("- ").strip()
+                for line in framing_match.group(1).strip().splitlines()
+                if line.strip() and line.strip() != "-"
+            ]
+        if bias_match:
+            bias_notes = bias_match.group(1).strip()
+
+        if not bias_notes:
+            bias_notes = "Bias analysis completed but no specific notes were generated."
 
         return LLMAnalysisResult(
             cluster_id=cluster_id,
             extracted_facts=facts,
             framing_notes=framing_notes,
-            bias_notes=bias_notes.strip() or "No significant framing differences detected.",
+            bias_notes=bias_notes,
             provider_used=provider,
         )
 
     def close(self) -> None:
+        """Release the underlying httpx connection pool."""
         self._client.close()
