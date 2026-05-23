@@ -5,14 +5,18 @@ Keeps settings separate from secrets, which must come from environment variables
 
 Dotenv loading
 --------------
-This module calls load_dotenv() once at import time so that all os.getenv()
-calls throughout the codebase see values from the project's .env file.
-The .env file must sit in the project root (same directory as main.py).
-Values already set in the real environment take precedence (override=False).
+This module does NOT call load_dotenv(). Environment loading is the sole
+responsibility of the process entry point (main.py). Doing it here would:
+  1. Double-load when invoked through main.py.
+  2. Silently pollute test environments with values from .env.
+  3. Make import-order affect whether env vars are visible.
+Callers must ensure load_dotenv() (or equivalent) has run before importing
+this module in any context where .env values are needed.
 
 Important: both get_settings() and get_sources() use @lru_cache, which means
-they return the same dict object for the entire lifetime of the process. This
-is intentional — config is read once at startup and held in memory.
+they return the same object for the entire lifetime of the process. The
+returned MappingProxyType is read-only — callers cannot accidentally mutate
+the shared cached config.
 
 Operational note: if you edit settings.yaml or sources.yaml while the
 scheduler is running, the changes will NOT take effect until the process
@@ -23,30 +27,36 @@ required after any config change.
 
 from __future__ import annotations
 
+import types
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
 import yaml
-from dotenv import load_dotenv
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 CONFIG_DIR = BASE_DIR / "config"
 
-# Load .env from project root once at import time.
-# override=False means real environment variables always win over .env values.
-load_dotenv(BASE_DIR / ".env", override=False)
-
 
 @lru_cache(maxsize=1)
-def get_settings() -> dict[str, Any]:
-    """Load and cache settings.yaml. Requires process restart to pick up changes."""
+def get_settings() -> types.MappingProxyType:
+    """Load and cache settings.yaml as a read-only mapping.
+
+    Returns a MappingProxyType so callers cannot accidentally mutate the
+    shared cached config object. Requires process restart to pick up changes.
+    """
     with open(CONFIG_DIR / "settings.yaml", "r", encoding="utf-8") as f:
-        return yaml.safe_load(f)
+        data = yaml.safe_load(f)
+    return types.MappingProxyType(data)
 
 
 @lru_cache(maxsize=1)
-def get_sources() -> dict[str, Any]:
-    """Load and cache sources.yaml. Requires process restart to pick up changes."""
+def get_sources() -> types.MappingProxyType:
+    """Load and cache sources.yaml as a read-only mapping.
+
+    Returns a MappingProxyType so callers cannot accidentally mutate the
+    shared cached config object. Requires process restart to pick up changes.
+    """
     with open(CONFIG_DIR / "sources.yaml", "r", encoding="utf-8") as f:
-        return yaml.safe_load(f)
+        data = yaml.safe_load(f)
+    return types.MappingProxyType(data)
