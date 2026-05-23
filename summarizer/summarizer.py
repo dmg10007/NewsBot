@@ -3,15 +3,15 @@
 Takes a StoryCluster + LLMAnalysisResult and produces a short,
 bias-stripped paragraph suitable for the email digest.
 
-Design rules:
-  - Summarize only facts extracted by the bias layer
-  - Never editorialize or infer intent
-  - Always note how many sources covered the story
-  - Flag if coverage is single-source (lower confidence)
-  - If LLM is unavailable, or the story is single-source, fall back to
-    the RSS description text from the best-credibility article.
-    Single-source stories have nothing to cross-compare, so the fallback
-    is equally informative at zero cost.
+Summary quality hierarchy (best to worst):
+  1. LLM summary from cross-source extracted facts  (multi-source clusters)
+  2. RSS description text (cleaned, echo-checked)   (any cluster)
+  3. Full article body scraped from the source URL  (fallback enrichment)
+  4. Brave Search snippets for the headline         (fallback enrichment)
+  5. Entity-based sentence                          (last resort)
+  6. Bare "full details via link" message           (absolute last resort)
+
+Levels 3-4 only fire when BRAVE_SEARCH_API_KEY is set and levels 1-2 fail.
 """
 
 from __future__ import annotations
@@ -27,6 +27,8 @@ import httpx
 from bias.llm_analyzer import LLMAnalysisResult
 from clustering.clusterer import StoryCluster
 from config.loader import get_settings
+from ingestion.article_fetcher import ArticleFetcher
+from ingestion.brave_search import BraveSearch
 
 logger = logging.getLogger(__name__)
 
@@ -55,7 +57,7 @@ class SourceLink:
     """A single article link with its source label and bias lean."""
     source_name: str
     url: str
-    bias_lean: Optional[str] = None  # e.g. "left", "center", "right", "center-left", "center-right"
+    bias_lean: Optional[str] = None
 
 
 @dataclass
@@ -79,12 +81,20 @@ class Summarizer:
         self._llama_model = os.getenv("LLAMA_CPP_MODEL", "llama3")
         self._max_tokens = self.settings["summarization"]["max_summary_tokens"]
         self._client = httpx.Client(timeout=60.0)
+        self._article_fetcher = ArticleFetcher()
+        self._brave = BraveSearch()
+        if self._brave.available:
+            logger.info("Brave Search enrichment enabled.")
+        else:
+            logger.info(
+                "Brave Search enrichment disabled (BRAVE_SEARCH_API_KEY not set)."
+            )
 
     def summarize(self, cluster: StoryCluster, analysis: LLMAnalysisResult) -> SummaryResult:
         facts = analysis.extracted_facts
         bias_notes = analysis.bias_notes
 
-        # Build per-source links, one per unique source (pick first article URL per source).
+        # Build per-source links, one per unique source.
         seen_sources: set[str] = set()
         source_links: list[SourceLink] = []
         for article in cluster.articles:
@@ -92,17 +102,13 @@ class Summarizer:
             url = article.raw.url
             if name not in seen_sources and url:
                 seen_sources.add(name)
-                bias_lean = getattr(article.raw, "bias_lean", None)
                 source_links.append(SourceLink(
                     source_name=name,
                     url=url,
-                    bias_lean=bias_lean,
+                    bias_lean=getattr(article.raw, "bias_lean", None),
                 ))
         source_links.sort(key=lambda s: s.source_name.lower())
 
-        # Skip local LLM for single-source stories or clusters with no
-        # extracted facts — there is nothing to cross-compare, so the
-        # RSS description fallback is equally informative at zero cost.
         if cluster.source_count > 1 and facts:
             summary = self._summarize_from_facts(facts, cluster)
             provider = "local"
@@ -122,6 +128,10 @@ class Summarizer:
             provider_used=provider,
             sources=source_links,
         )
+
+    # ------------------------------------------------------------------
+    # LLM path
+    # ------------------------------------------------------------------
 
     def _summarize_from_facts(self, facts: list[str], cluster: StoryCluster) -> str:
         facts_text = "\n".join(f"- {f}" for f in facts[:10])
@@ -153,77 +163,118 @@ class Summarizer:
         response.raise_for_status()
         return response.json()["choices"][0]["message"]["content"].strip()
 
-    def _fallback_summary(self, cluster: StoryCluster) -> str:
-        """Use the RSS description from the best-credibility article as the summary.
+    # ------------------------------------------------------------------
+    # Fallback path: RSS → article body → Brave snippets → entities
+    # ------------------------------------------------------------------
 
-        Priority:
-          1. RSS summary text from articles sorted by credibility, accepting the
-             first one that passes the headline-echo and minimum-length checks.
-          2. Last resort: a sentence built from extracted named entities.
+    def _fallback_summary(self, cluster: StoryCluster) -> str:
+        """Multi-tier fallback when the LLM path is unavailable or skipped.
+
+        Tier 1: RSS description (cleaned + echo-checked)
+        Tier 2: Full article body scraped from the source URL
+        Tier 3: Brave Search snippets for the headline
+        Tier 4: Entity-based sentence
+        Tier 5: Bare fallback message
         """
+        headline = cluster.representative_headline
+
+        # --- Tier 1: RSS description ---
         credibility_order = {"high": 0, "medium": 1, "low": 2}
         sorted_articles = sorted(
             cluster.articles,
             key=lambda a: credibility_order.get(a.raw.credibility, 2),
         )
-
-        headline = cluster.representative_headline
         for article in sorted_articles:
-            raw_summary = article.raw.summary.strip()
-            if not raw_summary:
+            raw = article.raw.summary.strip()
+            if not raw:
                 continue
-            cleaned = self._clean_rss_summary(raw_summary)
-            if not cleaned:
-                continue
-            if self._is_headline_echo(cleaned, headline):
-                logger.debug(
-                    "Discarding RSS summary (headline echo) for: %s", headline[:60]
-                )
-                continue
-            return cleaned
+            cleaned = self._clean_rss_summary(raw)
+            if cleaned and not self._is_headline_echo(cleaned, headline):
+                return cleaned
 
-        # Last resort: entity-based sentence
+        # --- Tier 2: Full article body scrape ---
+        for article in sorted_articles:
+            url = article.raw.url
+            if not url:
+                continue
+            body = self._article_fetcher.fetch_body(url)
+            if not body:
+                continue
+            summary = self._extract_summary_from_body(body, headline)
+            if summary:
+                logger.debug("Used article body for summary: %s", headline[:60])
+                return summary
+
+        # --- Tier 3: Brave Search snippets ---
+        if self._brave.available:
+            snippets = self._brave.search_snippets(headline)
+            if snippets:
+                summary = self._extract_summary_from_body(snippets, headline)
+                if summary:
+                    logger.debug("Used Brave snippets for summary: %s", headline[:60])
+                    return summary
+
+        # --- Tier 4: Entity-based sentence ---
         entities = list({
             e[0] for a in cluster.articles for e in a.entities
             if e[1] in ("PERSON", "ORG", "GPE", "LOC")
         })[:5]
         if entities:
-            return f"Key subjects: {', '.join(entities)}. Full details available via the source link(s) below."
+            return (
+                f"Key subjects: {', '.join(entities)}. "
+                f"Full details available via the source link(s) below."
+            )
+
+        # --- Tier 5: Bare fallback ---
         return "Full details available via the source link(s) below."
 
-    @staticmethod
-    def _clean_rss_summary(text: str) -> str:
-        """Strip HTML, remove source-name suffixes, collapse whitespace, cap at 2 sentences.
+    def _extract_summary_from_body(self, text: str, headline: str) -> str:
+        """Extract a clean 1-2 sentence summary from a body of text.
 
-        Some RSS feeds (Reuters, Axios) set the description field to just
-        "{headline}    {source name}" with no real summary text. We strip
-        trailing chunks that look like bare source attributions (all caps or
-        title-case words after 3+ spaces) before the headline-echo check.
+        Splits into sentences, discards ones that are headline echoes or too
+        short, and returns the first 1-2 that pass. This avoids feeding the
+        entire body to the LLM when we just need a brief summary snippet.
         """
-        # Remove HTML tags
-        text = re.sub(r"<[^>]+>", " ", text)
-        # Strip trailing "   Source Name" patterns (3+ spaces then a short label)
-        text = re.sub(r"\s{3,}[A-Z][^\n]{1,40}$", "", text).strip()
         # Collapse whitespace
         text = re.sub(r"\s+", " ", text).strip()
         if not text:
             return ""
-        # Cap at 2 sentences
+
+        sentences = re.split(r"(?<=[.!?])\s+", text)
+        good: list[str] = []
+        for sent in sentences:
+            sent = sent.strip()
+            if len(sent.split()) < _MIN_SUMMARY_WORDS:
+                continue
+            if self._is_headline_echo(sent, headline):
+                continue
+            good.append(sent)
+            if len(good) == 2:
+                break
+
+        return " ".join(good).strip()
+
+    # ------------------------------------------------------------------
+    # Shared text-cleaning utilities
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _clean_rss_summary(text: str) -> str:
+        """Strip HTML, remove source-name suffixes, collapse whitespace, cap at 2 sentences."""
+        text = re.sub(r"<[^>]+>", " ", text)
+        text = re.sub(r"\s{3,}[A-Z][^\n]{1,40}$", "", text).strip()
+        text = re.sub(r"\s+", " ", text).strip()
+        if not text:
+            return ""
         sentences = re.split(r"(?<=[.!?])\s+", text)
         result = " ".join(sentences[:2]).strip()
-        # Reject if too short to be informative
         if len(result.split()) < _MIN_SUMMARY_WORDS:
             return ""
         return result
 
     @staticmethod
     def _is_headline_echo(summary: str, headline: str) -> bool:
-        """Return True if the summary is just a restatement of the headline.
-
-        Computes the fraction of meaningful summary words (4+ chars, alpha)
-        that also appear in the headline. If >= _HEADLINE_OVERLAP_THRESHOLD,
-        the summary adds no new information and should be discarded.
-        """
+        """Return True if summary is a near-duplicate of the headline."""
         def meaningful_words(s: str) -> set[str]:
             return {w.lower() for w in re.findall(r"[a-zA-Z]{4,}", s)}
 
@@ -236,3 +287,5 @@ class Summarizer:
 
     def close(self) -> None:
         self._client.close()
+        self._article_fetcher.close()
+        self._brave.close()
