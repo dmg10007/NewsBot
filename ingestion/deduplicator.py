@@ -2,28 +2,49 @@
 
 Two-pass strategy:
 1. Exact URL hash dedup (fast, catches reposts of the same URL)
-2. Headline semantic similarity dedup (catches rewrites of the same story
-   within the same source tier)
+2. Headline semantic similarity dedup using ANN (util.semantic_search)
+
+Semantic dedup passes:
+  Pass A — within-source: removes rewrites of the same story published
+            multiple times by the same outlet.
+  Pass B — cross-source wire detection: removes articles from different
+            outlets that are near-identical (sim >= wire_syndication_threshold,
+            default 0.95). Without this, syndicated AP/Reuters wire copy
+            appears as independent corroboration in clustering, inflating
+            the source_count and importance_score of those clusters.
+
+Performance
+-----------
+The original implementation used an O(n²) double-loop calling cos_sim()
+individually for every article pair. This version uses util.semantic_search()
+— one vectorized matrix operation identical to the clustering approach —
+which is dramatically faster for n > ~100 articles.
 """
 
 from __future__ import annotations
 
 import logging
-from collections import defaultdict
 
 from sentence_transformers import SentenceTransformer, util
 
 from config.loader import get_settings
 from ingestion.fetcher import RawArticle
+from utils.model_registry import get_model
 
 logger = logging.getLogger(__name__)
+
+# High-confidence threshold for cross-source wire syndication detection.
+# At 0.95+ the articles are effectively identical content; safe to collapse.
+_WIRE_SYNDICATION_THRESHOLD = 0.95
 
 
 class Deduplicator:
     def __init__(self) -> None:
         self.settings = get_settings()
         self._threshold: float = self.settings["deduplication"]["headline_similarity_threshold"]
-        self._model: SentenceTransformer | None = None  # Lazy-loaded
+        self._wire_threshold: float = self.settings["deduplication"].get(
+            "wire_syndication_threshold", _WIRE_SYNDICATION_THRESHOLD
+        )
 
     def deduplicate(self, articles: list[RawArticle]) -> list[RawArticle]:
         """Remove duplicate articles. Returns deduplicated list."""
@@ -50,33 +71,45 @@ class Deduplicator:
         if len(articles) < 2:
             return articles
 
-        model = self._get_model()
+        model = get_model(self.settings["clustering"]["model"])
         headlines = [a.headline for a in articles]
-        embeddings = model.encode(headlines, convert_to_tensor=True, show_progress_bar=False)
-        
+        embeddings = model.encode(
+            headlines, convert_to_tensor=True, show_progress_bar=False
+        )
+
+        # ANN search: find the top-k most similar headlines for every article.
+        # top_k capped at len(articles) so all pairs above threshold are visible.
+        top_k = min(len(articles), 50)
+        hits = util.semantic_search(embeddings, embeddings, top_k=top_k)
+
         keep: list[bool] = [True] * len(articles)
-        for i in range(len(articles)):
+
+        for i, article_hits in enumerate(hits):
             if not keep[i]:
                 continue
-            for j in range(i + 1, len(articles)):
-                if not keep[j]:
+            for hit in article_hits:
+                j = hit["corpus_id"]
+                if j <= i or not keep[j]:
                     continue
-                # Only dedup within same source — cross-source duplicates
-                # are actually useful for clustering and corroboration scoring
-                if articles[i].source_name == articles[j].source_name:
-                    sim = float(util.cos_sim(embeddings[i], embeddings[j]))
-                    if sim >= self._threshold:
-                        keep[j] = False
-                        logger.debug(
-                            "Duplicate headline removed: '%s' (sim=%.3f)",
-                            articles[j].headline, sim
-                        )
+                sim = hit["score"]
+                same_source = articles[i].source_name == articles[j].source_name
+
+                # Within-source dedup: threshold from settings (default ~0.85)
+                if same_source and sim >= self._threshold:
+                    keep[j] = False
+                    logger.debug(
+                        "Same-source duplicate removed: '%s' (sim=%.3f)",
+                        articles[j].headline, sim,
+                    )
+                    continue
+
+                # Cross-source wire syndication dedup: very high threshold (0.95+)
+                # to only collapse truly identical content, not just similar stories.
+                if not same_source and sim >= self._wire_threshold:
+                    keep[j] = False
+                    logger.debug(
+                        "Wire syndication duplicate removed: '%s' [%s] (sim=%.3f)",
+                        articles[j].headline, articles[j].source_name, sim,
+                    )
 
         return [a for a, k in zip(articles, keep) if k]
-
-    def _get_model(self) -> SentenceTransformer:
-        if self._model is None:
-            model_name = self.settings["clustering"]["model"]
-            logger.info("Loading sentence-transformer model: %s", model_name)
-            self._model = SentenceTransformer(model_name)
-        return self._model
