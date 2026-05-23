@@ -1,223 +1,198 @@
-"""APScheduler-based job scheduler.
+"""Digest scheduler: runs the full NewsBot pipeline on a cron schedule.
 
-Runs the full pipeline twice daily at 6:00 AM and 6:00 PM ET.
-The scheduler is blocking and designed to run as a long-lived process
-(e.g., a systemd service or a simple 'python -m scheduler.scheduler' call).
+Import strategy
+---------------
+All pipeline imports are at module level (not deferred inside run_digest).
+This means a broken or missing module raises ImportError at process startup,
+not silently at 6 AM when the first digest fires. _validate_imports() is
+called by start_scheduler() to make this fail-fast guarantee explicit.
 
-Timezone handling: APScheduler CronTrigger accepts a pytz timezone string.
-Using 'America/New_York' handles EDT/EST transitions automatically.
+Failure alerting
+----------------
+If run_digest() raises an unhandled exception, _send_failure_alert() is
+called before re-raising. It attempts to deliver an alert via TelegramSender
+first, then EmailSender as fallback. Operators should not need to tail logs
+to discover a broken run.
 
-Note: .env loading is the responsibility of the entry point (main.py).
-This module does NOT call load_dotenv() — doing so here would load the file
-a second time when invoked through main.py, and would silently skip env vars
-already set if run standalone after the environment was mutated.
+Summarizer lifecycle
+--------------------
+Summarizer is used as a context manager (`with Summarizer() as s`) so its
+three httpx.Client instances are always released, even when an exception
+occurs mid-run.
 """
 
 from __future__ import annotations
 
 import logging
-import signal
-import sys
-from datetime import datetime
+from datetime import datetime, timezone
 
 from apscheduler.schedulers.blocking import BlockingScheduler
 from apscheduler.triggers.cron import CronTrigger
 
+from bias.llm_analyzer import LLMAnalyzer
+from bias.framing import FramingAnalyzer
+from clustering.clusterer import StoryClusterer
+from config.loader import get_settings, get_sources
+from delivery.email_sender import EmailSender
+from delivery.telegram_sender import TelegramSender
+from ingestion.pipeline import ingest_all_sources
+from monitoring.health_check import record_run
+from parsing.extractor import ArticleExtractor
+from summarizer.summarizer import Summarizer
+
 logger = logging.getLogger(__name__)
 
 
-def run_digest(period: str) -> None:
-    """Full pipeline: ingest → parse → cluster → bias → summarize → deliver."""
-    from datetime import timezone
-    from config.loader import get_settings
-    from ingestion.fetcher import FeedFetcher
-    from ingestion.scraper import SCRAPER_REGISTRY
-    from ingestion.deduplicator import Deduplicator
-    from parsing.extractor import ArticleExtractor
-    from parsing.normalizer import Normalizer
-    from clustering.clusterer import StoryClusterer
-    from bias.lexicon import LexiconAnalyzer
-    from bias.framing import FramingAnalyzer, FramingResult
-    from bias.llm_analyzer import LLMAnalyzer, LLMAnalysisResult
-    from summarizer.summarizer import Summarizer
-    from delivery.email_renderer import render_digest
-    from delivery.email_sender import EmailSender
-    from delivery.telegram_bot import TelegramSender
+def _validate_imports() -> None:
+    """Verify all pipeline modules are importable at scheduler startup.
 
+    Called once by start_scheduler() so that a broken module raises
+    ImportError immediately — not silently at the first scheduled run.
+    All imports are already at module level; this function exists as an
+    explicit fast-fail contract and documents which modules are required.
+    """
+    # All required names are already imported at module level above.
+    # If any were missing, the process would have already crashed on import.
+    # This function serves as a readable checklist and can be extended with
+    # runtime capability checks (e.g. model file present, API key set).
     settings = get_settings()
-    run_date = datetime.now(tz=timezone.utc)
-    logger.info("=== NewsBot %s digest run started ===", period.upper())
+    if not settings.get("scheduler"):
+        raise RuntimeError("settings.yaml is missing the [scheduler] section")
+    logger.info("Import validation passed. Scheduler ready.")
 
-    # --- 1. Ingest ---
-    from config.loader import get_sources
+
+def _send_failure_alert(period: str, exc: Exception) -> None:
+    """Best-effort failure alert via Telegram then Email.
+
+    Swallows any exception raised by the delivery layer so it never masks
+    the original error that triggered the alert.
+    """
+    message = (
+        f"NewsBot digest FAILED\n"
+        f"Period: {period}\n"
+        f"Time: {datetime.now(timezone.utc).isoformat()}\n"
+        f"Error: {type(exc).__name__}: {exc}"
+    )
+    try:
+        TelegramSender().send_alert(message)
+        logger.info("Failure alert sent via Telegram")
+        return
+    except Exception as telegram_exc:
+        logger.warning("Telegram alert failed: %s", telegram_exc)
+
+    try:
+        EmailSender().send_alert(message)
+        logger.info("Failure alert sent via Email")
+    except Exception as email_exc:
+        logger.warning("Email alert also failed: %s", email_exc)
+
+
+def run_digest(period: str = "morning") -> None:
+    """Execute one full digest pipeline run for the given period.
+
+    Args:
+        period: One of 'morning', 'afternoon', 'evening'. Controls which
+                delivery targets are active per settings.yaml.
+
+    Raises:
+        Re-raises any unhandled exception after sending a failure alert.
+    """
+    try:
+        _run_digest_inner(period)
+    except Exception as exc:
+        logger.critical(
+            "Digest run failed for period '%s': %s", period, exc, exc_info=True
+        )
+        _send_failure_alert(period, exc)
+        raise
+
+
+def _run_digest_inner(period: str) -> None:
+    """Inner implementation of the digest pipeline (no exception wrapping)."""
+    settings = get_settings()
     sources = get_sources()
-    fetcher = FeedFetcher()
-    raw_articles = []
+    start_time = datetime.now(timezone.utc)
+    logger.info("Starting %s digest at %s", period, start_time.isoformat())
 
-    for tier_name in ("national", "state"):
-        tier = sources.get(tier_name, {})
-        rss_sources = tier.get("rss", [])
-        if rss_sources:
-            raw_articles.extend(fetcher.fetch_all(rss_sources))
-        for scraper_source in tier.get("scrapers", []):
-            cls = SCRAPER_REGISTRY.get(scraper_source.get("scraper_class", ""))
-            if cls:
-                scraper = cls(scraper_source)
-                try:
-                    raw_articles.extend(scraper.scrape())
-                finally:
-                    scraper.close()
-
-    local_tier = sources.get("local", {})
-    for scraper_source in local_tier.get("scrapers", []):
-        cls = SCRAPER_REGISTRY.get(scraper_source.get("scraper_class", ""))
-        if cls:
-            scraper = cls(scraper_source)
-            try:
-                raw_articles.extend(scraper.scrape())
-            finally:
-                scraper.close()
-
-    fetcher.close()
-    logger.info("Ingested %d raw articles", len(raw_articles))
-
-    # --- 2. Deduplicate ---
-    raw_articles = Deduplicator().deduplicate(raw_articles)
-    logger.info("%d articles after deduplication", len(raw_articles))
-
-    # Filter by lookback window
-    from datetime import timedelta
-    lookback_hours = settings["schedule"][f"{period}_digest"]["lookback_hours"]
-    cutoff = run_date - timedelta(hours=lookback_hours)
-    raw_articles = [
-        a for a in raw_articles
-        if a.published_at is None or a.published_at >= cutoff
-    ]
-    logger.info("%d articles within %dh lookback window", len(raw_articles), lookback_hours)
-
-    if not raw_articles:
-        logger.warning("No articles found in lookback window. Skipping digest.")
+    # Stage 1: Ingest + deduplicate
+    articles = ingest_all_sources(sources)
+    if not articles:
+        logger.warning("No articles ingested — aborting digest run")
         return
 
-    # --- 3. Parse ---
+    # Stage 2: Parse / NLP extraction
     extractor = ArticleExtractor()
-    parsed = extractor.extract_all(raw_articles)
-    parsed = Normalizer().normalize_all(parsed)
+    parsed = extractor.extract_all(articles)
 
-    # --- 4. Cluster ---
-    clusters = StoryClusterer().cluster(parsed)
+    # Stage 3: Cluster into stories
+    clusterer = StoryClusterer()
+    clusters = clusterer.cluster(parsed)
+    logger.info("Produced %d story clusters", len(clusters))
 
-    # Score clusters: credibility + source count + tier + recency
-    import math
-    credibility_map = {"high": 1.0, "medium": 0.7, "low": 0.4}
-    weights = settings["scoring"]["weights"]
-    tier_weights = {"national": weights["national_tier"], "state": weights["state_tier"], "local": weights["local_tier"]}
-    decay = weights["recency_decay"]
-    for cluster in clusters:
-        score = 0.0
-        for article in cluster.articles:
-            score += credibility_map.get(article.raw.credibility, 0.7)
-            score += weights["source_count"]
-        for tier in cluster.tiers:
-            score *= tier_weights.get(tier, 1.0)
-        if cluster.earliest_published:
-            age_hours = (run_date - cluster.earliest_published).total_seconds() / 3600
-            score *= max(0.1, 1 - decay * age_hours)
-        cluster.importance_score = score
-
-    clusters.sort(key=lambda c: c.importance_score, reverse=True)
-
-    # --- 5. Bias analysis ---
-    lexicon_analyzer = LexiconAnalyzer(
-        escalation_threshold=settings["bias_detection"]["llm_escalation_threshold"]
-    )
+    # Stage 4: Framing analysis (lexicon-based, no LLM)
     framing_analyzer = FramingAnalyzer()
+    framing_results = {c.cluster_id: framing_analyzer.analyze(c) for c in clusters}
+
+    # Stage 5: LLM bias analysis (capped, degrades gracefully)
     llm_analyzer = LLMAnalyzer(
-        max_calls=settings["bias_detection"]["max_llm_calls_per_run"]
+        max_calls=settings["bias"].get("max_llm_calls_per_run", 50)
     )
-
-    analysis_map: dict[int, LLMAnalysisResult] = {}
-    for cluster in clusters:
-        lexicon_result = lexicon_analyzer.analyze(cluster)
-        if lexicon_result.escalate and cluster.source_count > 1:
-            framing_result = framing_analyzer.analyze(cluster)
-            analysis = llm_analyzer.analyze(cluster, framing_result)
-        else:
-            # Skip LLM entirely for non-escalated clusters — no API cost.
-            analysis = LLMAnalysisResult(
-                cluster_id=cluster.cluster_id,
-                extracted_facts=[],
-                framing_notes=[],
-                bias_notes="No significant framing differences detected.",
-                provider_used="none",
-                skipped=False,
+    llm_results = {}
+    try:
+        for cluster in clusters:
+            llm_results[cluster.cluster_id] = llm_analyzer.analyze(
+                cluster, framing_results[cluster.cluster_id]
             )
-        analysis_map[cluster.cluster_id] = analysis
+    finally:
+        llm_analyzer.close()
 
-    llm_analyzer.close()
+    # Stage 6: Summarize (context manager ensures httpx clients are released)
+    with Summarizer() as summarizer:
+        summaries = summarizer.summarize_all(clusters)
 
-    # --- 6. Summarize ---
-    summarizer = Summarizer()
-    summaries = [
-        summarizer.summarize(cluster, analysis_map[cluster.cluster_id])
-        for cluster in clusters
-    ]
-    summarizer.close()
+    # Attach bias notes from LLM results
+    for s in summaries:
+        llm = llm_results.get(s.cluster_id)
+        if llm:
+            s.bias_notes = llm.bias_notes
 
-    # --- 7. Deliver ---
-    html = render_digest(summaries, period, run_date)
+    # Stage 7: Deliver
+    delivery_settings = settings["delivery"].get(period, {})
+    if delivery_settings.get("telegram", {}).get("enabled"):
+        TelegramSender().send_digest(summaries, period=period)
+    if delivery_settings.get("email", {}).get("enabled"):
+        EmailSender().send_digest(summaries, period=period)
 
-    email_cfg = settings["delivery"]["email"]
-    if email_cfg.get("enabled", True):
-        try:
-            EmailSender().send(html, period, run_date)
-        except EnvironmentError as exc:
-            logger.error("Email delivery skipped: %s", exc)
-
-    telegram_cfg = settings["delivery"]["telegram"]
-    if telegram_cfg.get("enabled", False):
-        TelegramSender().send(summaries, period, run_date)
-
-    logger.info("=== NewsBot %s digest complete ===", period.upper())
+    elapsed = (datetime.now(timezone.utc) - start_time).total_seconds()
+    logger.info("Digest complete in %.1fs — %d stories delivered", elapsed, len(summaries))
+    record_run(period=period, story_count=len(summaries), elapsed_seconds=elapsed)
 
 
-def main() -> None:
-    import logging
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
-    )
+def start_scheduler() -> None:
+    """Start the blocking APScheduler with cron triggers from settings.yaml.
 
+    Calls _validate_imports() first to fail fast if any pipeline module is
+    broken or misconfigured.
+    """
+    _validate_imports()
+    settings = get_settings()
     scheduler = BlockingScheduler(timezone="America/New_York")
 
-    scheduler.add_job(
-        run_digest,
-        trigger=CronTrigger(hour=6, minute=0, timezone="America/New_York"),
-        args=["morning"],
-        id="morning_digest",
-        name="Morning Digest (6:00 AM ET)",
-        misfire_grace_time=300,  # 5 min grace window if system was briefly down
-    )
-    scheduler.add_job(
-        run_digest,
-        trigger=CronTrigger(hour=18, minute=0, timezone="America/New_York"),
-        args=["evening"],
-        id="evening_digest",
-        name="Evening Digest (6:00 PM ET)",
-        misfire_grace_time=300,
-    )
+    schedule = settings["scheduler"]["schedule"]
+    for period, cron_expr in schedule.items():
+        scheduler.add_job(
+            run_digest,
+            trigger=CronTrigger.from_crontab(cron_expr),
+            kwargs={"period": period},
+            id=f"digest_{period}",
+            name=f"NewsBot {period} digest",
+            misfire_grace_time=300,
+            coalesce=True,
+        )
+        logger.info("Scheduled %s digest: %s", period, cron_expr)
 
-    def _shutdown(sig, frame):
-        logger.info("Shutdown signal received. Stopping scheduler.")
-        scheduler.shutdown(wait=False)
-        sys.exit(0)
-
-    signal.signal(signal.SIGINT, _shutdown)
-    signal.signal(signal.SIGTERM, _shutdown)
-
-    logger.info("NewsBot scheduler started. Morning: 6:00 AM ET | Evening: 6:00 PM ET")
-    scheduler.start()
-
-
-if __name__ == "__main__":
-    main()
+    logger.info("Scheduler starting. Press Ctrl+C to stop.")
+    try:
+        scheduler.start()
+    except KeyboardInterrupt:
+        logger.info("Scheduler stopped by user")
