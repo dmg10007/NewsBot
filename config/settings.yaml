@@ -1,6 +1,20 @@
 # NewsBot Settings
 # Sensitive values (API keys, email addresses) must be set in .env
-# This file contains only non-sensitive configuration
+# This file contains only non-sensitive configuration.
+#
+# Key naming contract (settings.yaml top-level key → Python module that reads it):
+#   app           → config/loader.py
+#   schedule      → scheduler/scheduler.py (digest times)
+#   topics        → scheduler/scheduler.py (story caps)
+#   geography     → ingestion/pipeline.py
+#   ingestion     → ingestion/fetcher.py, ingestion/scraper.py
+#   deduplication → ingestion/deduplicator.py
+#   clustering    → clustering/clusterer.py
+#   bias          → bias/llm_analyzer.py, bias/framing.py
+#   summarizer    → summarizer/summarizer.py
+#   delivery      → scheduler/scheduler.py, delivery/email_renderer.py
+#   scheduler     → scheduler/scheduler.py (cron expressions)
+#   scoring       → scheduler/scheduler.py (story ranking)
 
 app:
   name: NewsBot
@@ -11,7 +25,7 @@ schedule:
   morning_digest:
     hour: 6
     minute: 0
-    lookback_hours: 12  # Articles published in the last 12 hours
+    lookback_hours: 12
   evening_digest:
     hour: 18
     minute: 0
@@ -20,7 +34,7 @@ schedule:
 topics:
   enabled: [politics, economy, current_events]
   current_events:
-    max_stories: 5  # Top 5 current_events stories per digest
+    max_stories: 5
   politics:
     max_stories: 10
   economy:
@@ -36,68 +50,93 @@ ingestion:
   request_timeout_seconds: 15
   max_retries: 3
   retry_backoff_seconds: 2
-  cache_ttl_seconds: 3600       # 1 hour — don't re-fetch the same feed
+  cache_ttl_seconds: 3600
   user_agent: "NewsBot/1.0 (personal news aggregator; contact via github)"
-  max_articles_per_source: 20  # Cap per source per run to avoid noise
-  request_delay_seconds: 1.5   # Inter-request delay (seconds) between source fetches
+  max_articles_per_source: 20
+  request_delay_seconds: 1.5  # Inter-request delay between source fetches
 
 deduplication:
   url_hash: true
-  headline_similarity_threshold: 0.92  # Cosine similarity — above this = duplicate
+  headline_similarity_threshold: 0.92
 
 clustering:
   model: all-MiniLM-L6-v2
-  similarity_threshold: 0.72   # Stories above this score grouped into same cluster
-  min_sources_to_report: 1     # Report even single-source stories (local)
-  cross_tier_boost: true       # Boost clusters that appear in multiple tiers
+  similarity_threshold: 0.72
+  min_sources_to_report: 1
+  cross_tier_boost: true
 
-# Key was previously 'bias_detection' — renamed to 'bias' to match all Python
-# module references (settings["bias"]). No code changes required.
+# Read by bias/llm_analyzer.py and bias/framing.py as settings["bias"]
 bias:
   always_run_lexicon: true
   always_run_sentiment: true
-  llm_escalation_threshold: 0.35   # Escalate if sentiment variance > this across sources
-  llm_provider: perplexity          # perplexity | local
-  llm_model: sonar                  # Current Perplexity model. sonar-reasoning was deprecated (HTTP 400).
-  llm_fallback: local               # Falls back to llama.cpp if perplexity unavailable
-  llm_fallback_model: llama3        # Model name in your llama.cpp instance
-  max_llm_calls_per_run: 20         # Hard cap to control API costs
+  llm_escalation_threshold: 0.35
+  llm_provider: perplexity         # perplexity | local
+  llm_model: sonar
+  llm_fallback: local
+  llm_fallback_model: llama3
+  max_llm_calls_per_run: 20        # Set to 0 to disable LLM analysis entirely
 
-summarization:
-  provider: local                   # local | anthropic
-  model: llama3                     # llama.cpp model name
+# Read by summarizer/summarizer.py as settings["summarizer"]
+# Previously named 'summarization' — renamed to match Python module references.
+summarizer:
+  provider: local                       # local | perplexity
+  model: llama3
   max_summary_tokens: 150
-  neutral_prompt_version: v1        # Bump to invalidate cached prompts on change
+  neutral_prompt_version: v1            # Bump to invalidate cached prompts
+  request_timeout_seconds: 60.0         # Timeout for LLM API calls (seconds)
+  article_fetch_timeout_seconds: 15.0   # Timeout for full-text article fetches
+  brave_enrich_threshold: 0.7           # Enrich with Brave Search if importance >= this
 
+# Read by scheduler.py as settings["delivery"].get(period, {})
+# Each period key controls which channels fire for that digest.
+# Channel credentials (API keys, addresses) live in .env — not here.
 delivery:
-  email:
-    enabled: true
-    # NEWSBOT_EMAIL_TO and NEWSBOT_EMAIL_FROM set in .env
-    max_recipients: 5
-    subject_morning: "NewsBot Morning Briefing — {date}"
-    subject_evening: "NewsBot Evening Briefing — {date}"
-    bias_tag_colors:
-      left:         "#1565c0"
-      center-left:  "#1976d2"
-      center:       "#388e3c"
-      center-right: "#e64a19"
-      right:        "#b71c1c"
-      unknown:      "#757575"
-  telegram:
-    enabled: false   # Set to true and add NEWSBOT_TELEGRAM_TOKEN + NEWSBOT_TELEGRAM_CHAT_ID in .env
+  # Per-period delivery switches — set enabled: false to silence a channel
+  # for a specific period without disabling it globally.
+  morning:
+    email:
+      enabled: true
+    telegram:
+      enabled: false
+  afternoon:
+    email:
+      enabled: false
+    telegram:
+      enabled: false
+  evening:
+    email:
+      enabled: true
+    telegram:
+      enabled: false
 
+  # Shared channel configuration (read by EmailSender / TelegramSender directly)
+  channels:
+    email:
+      max_recipients: 5
+      subject_morning: "NewsBot Morning Briefing — {date}"
+      subject_evening: "NewsBot Evening Briefing — {date}"
+      bias_tag_colors:
+        left:         "#1565c0"
+        center-left:  "#1976d2"
+        center:       "#388e3c"
+        center-right: "#e64a19"
+        right:        "#b71c1c"
+        unknown:      "#757575"
+    telegram:
+      parse_mode: HTML   # HTML | Markdown
+
+# Cron expressions for start_scheduler() — read as settings["scheduler"]["schedule"]
 scheduler:
   schedule:
     morning: "0 6 * * *"    # 6:00 AM Eastern
     evening: "0 18 * * *"   # 6:00 PM Eastern
 
 scoring:
-  # Story importance weights — used to rank within topic buckets
   weights:
-    source_count: 0.3       # Per additional corroborating source
-    local_tier: 1.5         # Local stories boosted
+    source_count: 0.3
+    local_tier: 1.5
     state_tier: 1.2
     national_tier: 1.0
-    recency_decay: 0.05     # Score reduction per hour of age
-  # Note: source_credibility weighting is handled inline in scheduler.py
-  # via a hardcoded map {high: 1.0, medium: 0.7, low: 0.4}
+    recency_decay: 0.05
+  # source_credibility weighting handled inline in scheduler.py:
+  # {high: 1.0, medium: 0.7, low: 0.4}
