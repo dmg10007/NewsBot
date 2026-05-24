@@ -96,17 +96,24 @@ ingestion:
 
 deduplication:
   url_hash: true
-  headline_similarity_threshold: 0.92
+  # Raised from 0.92 → 0.95 to catch more wire-syndicated near-duplicates
+  # before they enter clustering and inflate cluster count.
+  headline_similarity_threshold: 0.95
 
 clustering:
   model: all-MiniLM-L6-v2
-  # Lower threshold catches same-event stories written differently across outlets.
-  # 0.65 is the recommended floor; go lower only if duplicates persist.
-  similarity_threshold: 0.65
-  # Articles published more than this many hours apart won't be merged,
-  # even if semantically similar. Prevents topic-drift across days.
-  max_age_delta_hours: 24
-  min_sources_to_report: 1
+  # Raised from 0.65 → 0.82. Articles must now be substantially more alike
+  # to be grouped. This is the primary lever for reducing cluster count.
+  # 0.65 was too permissive — loosely related stories were merging into
+  # many small clusters instead of consolidating around the same event.
+  similarity_threshold: 0.82
+  # Reduced from 24 → 12 hours. Prevents stale articles from a prior run
+  # from merging with fresh ones and creating cross-period cluster noise.
+  max_age_delta_hours: 12
+  # Raised from 1 → 2. Singleton clusters (1 article, 1 source) are almost
+  # always noise — wire stubs, opinion pieces, or hyper-local one-offs.
+  # Requiring at least 2 sources trims output without losing real coverage.
+  min_sources_to_report: 2
   cross_tier_boost: true
 
 bias:
