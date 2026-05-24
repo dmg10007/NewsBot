@@ -4,14 +4,17 @@ Pipeline per cluster:
   1. Attempt to fetch full article text via ArticleFetcher (httpx + trafilatura)
   2. Fall back to RSS summary if fetch fails or yields < MIN_CONTENT_CHARS
   3. Optionally enrich with Brave Search context for high-importance clusters
-  4. Call Perplexity Sonar (or extractive fallback) to produce a neutral summary
+  4. Route to the appropriate LLM based on importance score and API caps:
+       - High importance + cap not reached  -> Perplexity Sonar
+       - Low importance OR cap reached      -> local llama.cpp
+       - Local model unavailable            -> extractive fallback (3 sentences)
   5. Return a SummarizedCluster ready for digest rendering
 
 Connection management
 ---------------------
-Summarizer owns three httpx.Client instances (via ArticleFetcher and
-BraveSearchClient). Always call summarizer.close() when done, or use it
-as a context manager:
+Summarizer owns four httpx.Client instances (via ArticleFetcher,
+BraveSearchClient, and LocalLLMClient). Always call summarizer.close()
+when done, or use it as a context manager:
 
     with Summarizer() as s:
         results = s.summarize_all(clusters)
@@ -19,16 +22,17 @@ as a context manager:
 Failure modes
 -------------
 The summarizer degrades gracefully:
-  - Full text fetch fails       -> uses RSS summary
-  - Brave enrichment fails      -> skips enrichment, continues
-  - LLM call fails after retry  -> extractive fallback (first 3 sentences)
-  - Per-run cap exceeded        -> extractive fallback
-  - Importance score too low    -> extractive fallback (no API call made)
+  - Full text fetch fails              -> uses RSS summary
+  - Brave enrichment fails             -> skips enrichment, continues
+  - Perplexity fails after retry       -> routes to local LLM
+  - Local LLM unavailable / fails      -> extractive fallback (3 sentences)
+  - Per-run Perplexity cap exceeded    -> routes to local LLM
+  - Importance score below threshold   -> routes to local LLM
 A SummarizedCluster is always returned; nothing is silently dropped.
 
 Token budget
 ------------
-Input text is truncated to MAX_INPUT_CHARS (4000) before the LLM call.
+Input text is truncated to MAX_INPUT_CHARS (4000) before any LLM call.
 
 Concurrency
 -----------
@@ -39,18 +43,16 @@ against a single hanging cluster blocking the pool.
 
 Perplexity rate-limit strategy
 -------------------------------
-Three overlapping guards prevent 429 errors:
+Four overlapping guards prevent 429 errors:
 
-  1. _pplx_throttle_lock  — a threading.Lock serialising the inter-call
-     delay so parallel workers queue behind each other rather than firing
-     simultaneously.
-  2. _pplx_calls / pplx_max_calls_per_run  — hard cap; clusters over the
-     cap receive extractive fallback immediately.
-  3. _call_perplexity_with_retry()  — catches 429 (and 5xx) responses and
-     retries with exponential backoff before giving up. Respects the
-     Retry-After header when present.
-  4. Importance gate  — clusters below pplx_min_importance_score never
-     reach the API; extractive fallback is adequate for low-signal stories.
+  1. Importance gate — clusters below pplx_min_importance_score are
+     routed to the local LLM without touching the Perplexity API.
+  2. Per-run cap — _pplx_calls counter (thread-safe); clusters over
+     pplx_max_calls_per_run are routed to the local LLM.
+  3. _pplx_throttle_lock — serialises the inter-call delay across all
+     workers so they queue rather than burst.
+  4. _call_perplexity_with_retry() — exponential backoff on 429/5xx;
+     on final failure routes to local LLM (not bare extractive).
 
 Timeout configuration (settings.yaml)
 --------------------------------------
@@ -65,6 +67,14 @@ summarizer:
   pplx_min_importance_score: 0.3
   pplx_retry_attempts: 3
   pplx_retry_base_delay: 2.0
+  model: llama3           # local model name passed to llama.cpp
+
+Environment variables
+---------------------
+  PPLX_API_KEY         — enables Perplexity path (required for cloud summarization)
+  LLAMA_CPP_BASE_URL   — base URL of local llama.cpp server
+                         (default: http://localhost:8080)
+  LLAMA_CPP_MODEL      — overrides settings.summarizer.model for local path
 """
 
 from __future__ import annotations
@@ -89,6 +99,7 @@ MIN_CONTENT_CHARS = 200
 MAX_INPUT_CHARS = 4000
 _PPLX_API_URL = "https://api.perplexity.ai/chat/completions"
 _PPLX_MODEL = "sonar"
+_LOCAL_LLM_DEFAULT_BASE = "http://localhost:8080"
 
 _DEFAULT_READ_TIMEOUT = 45.0
 _DEFAULT_CONNECT_TIMEOUT = 10.0
@@ -99,6 +110,12 @@ _DEFAULT_PPLX_MAX_CALLS = 15
 _DEFAULT_PPLX_MIN_SCORE = 0.3
 _DEFAULT_PPLX_RETRY_ATTEMPTS = 3
 _DEFAULT_PPLX_RETRY_BASE_DELAY = 2.0
+
+_NEUTRAL_SYSTEM_PROMPT = (
+    "You are a neutral news summarizer. Produce a concise 2-3 sentence "
+    "summary containing only verifiable facts. Remove editorial framing, "
+    "emotional language, and opinion. Use plain, direct language."
+)
 
 
 @dataclass
@@ -117,7 +134,10 @@ class SummarizedCluster:
     source_links: list[tuple[str, str]] = field(default_factory=list)
     # {source_name: lean_label} map for bias color rendering in the email.
     source_bias: dict[str, str] = field(default_factory=dict)
+    # True only for pure extractive (3-sentence) fallback — not for local LLM.
     fallback_used: bool = False
+    # Which backend produced this summary: "perplexity" | "local" | "extractive"
+    summary_backend: str = "extractive"
 
 
 class ArticleFetcher:
@@ -180,8 +200,55 @@ class BraveSearchClient:
         self._client.close()
 
 
+class LocalLLMClient:
+    """Calls a local llama.cpp server via its OpenAI-compatible chat endpoint.
+
+    The server must be running and expose POST /v1/chat/completions.
+    Base URL is read from LLAMA_CPP_BASE_URL (default: http://localhost:8080).
+    Model name is read from LLAMA_CPP_MODEL env var, falling back to
+    settings.summarizer.model, then to 'llama3'.
+    """
+
+    def __init__(self, model: str, timeout: float = 45.0) -> None:
+        base = os.getenv("LLAMA_CPP_BASE_URL", _LOCAL_LLM_DEFAULT_BASE).rstrip("/")
+        self._url = f"{base}/v1/chat/completions"
+        # env var takes precedence over settings value
+        self._model = os.getenv("LLAMA_CPP_MODEL", model)
+        self._client = httpx.Client(
+            timeout=httpx.Timeout(connect=5.0, read=timeout, write=10.0, pool=5.0)
+        )
+
+    def available(self) -> bool:
+        """Return True if LLAMA_CPP_BASE_URL is configured (non-default or explicitly set)."""
+        return bool(os.getenv("LLAMA_CPP_BASE_URL", ""))
+
+    def summarize(self, input_text: str, max_tokens: int = 150) -> str:
+        """Return a neutral summary from the local model, or raise on failure."""
+        payload = {
+            "model": self._model,
+            "messages": [
+                {"role": "system", "content": _NEUTRAL_SYSTEM_PROMPT},
+                {"role": "user", "content": input_text},
+            ],
+            "max_tokens": max_tokens,
+            "temperature": 0.1,
+        }
+        response = self._client.post(self._url, json=payload)
+        response.raise_for_status()
+        return response.json()["choices"][0]["message"]["content"].strip()
+
+    def close(self) -> None:
+        self._client.close()
+
+
 class Summarizer:
     """Produces neutral summaries for each StoryCluster.
+
+    Routing:
+      - Clusters at or above pplx_min_importance_score -> Perplexity (if key set,
+        cap not reached, and request succeeds after retries)
+      - All other clusters -> local llama.cpp (if LLAMA_CPP_BASE_URL is set)
+      - Final fallback -> extractive (first 3 sentences, no LLM)
 
     Lifecycle: call close() (or use as a context manager) when done to release
     the underlying httpx connection pools.
@@ -197,6 +264,7 @@ class Summarizer:
         article_timeout: float = float(s.get("article_fetch_timeout_seconds", 15.0))
         self._max_workers: int = int(s.get("max_concurrent_summaries", _DEFAULT_MAX_WORKERS))
         self._cluster_timeout: float = float(s.get("cluster_timeout_seconds", _DEFAULT_CLUSTER_TIMEOUT))
+        self._max_summary_tokens: int = int(s.get("max_summary_tokens", 150))
 
         # Rate-limit controls
         self._pplx_call_delay: float = float(s.get("pplx_call_delay_seconds", _DEFAULT_PPLX_DELAY))
@@ -205,13 +273,13 @@ class Summarizer:
         self._pplx_retry_attempts: int = int(s.get("pplx_retry_attempts", _DEFAULT_PPLX_RETRY_ATTEMPTS))
         self._pplx_retry_base_delay: float = float(s.get("pplx_retry_base_delay", _DEFAULT_PPLX_RETRY_BASE_DELAY))
 
-        # Thread-safe call counter and throttle lock
+        # Thread-safe Perplexity call counter + throttle lock
         self._pplx_calls: int = 0
         self._pplx_call_lock: threading.Lock = threading.Lock()
-        # Shared lock that serialises the inter-call delay across workers
         self._pplx_throttle_lock: threading.Lock = threading.Lock()
 
         user_agent = self.settings["ingestion"]["user_agent"]
+        local_model: str = s.get("model", "llama3")
 
         self._client = httpx.Client(
             timeout=httpx.Timeout(
@@ -221,11 +289,9 @@ class Summarizer:
                 pool=5.0,
             )
         )
-        self._article_fetcher = ArticleFetcher(
-            timeout=article_timeout,
-            user_agent=user_agent,
-        )
+        self._article_fetcher = ArticleFetcher(timeout=article_timeout, user_agent=user_agent)
         self._brave = BraveSearchClient()
+        self._local_llm = LocalLLMClient(model=local_model, timeout=read_timeout)
 
     def __enter__(self) -> "Summarizer":
         return self
@@ -237,6 +303,7 @@ class Summarizer:
         self._client.close()
         self._article_fetcher.close()
         self._brave.close()
+        self._local_llm.close()
 
     def summarize_all(self, clusters: list[StoryCluster]) -> list[SummarizedCluster]:
         """Summarize every cluster in parallel. Returns results in input order."""
@@ -274,9 +341,7 @@ class Summarizer:
     def _summarize_cluster(self, cluster: StoryCluster) -> SummarizedCluster:
         input_text = self._build_input_text(cluster)
 
-        enrich_threshold = float(
-            self.settings["summarizer"].get("brave_enrich_threshold", 0.7)
-        )
+        enrich_threshold = float(self.settings["summarizer"].get("brave_enrich_threshold", 0.7))
         if cluster.importance_score >= enrich_threshold:
             snippets = self._brave.search(cluster.representative_headline, count=3)
             if snippets:
@@ -284,38 +349,7 @@ class Summarizer:
 
         input_text = input_text[:MAX_INPUT_CHARS]
 
-        summary: str
-        fallback: bool
-
-        if not self._pplx_key:
-            summary = self._extractive_fallback(input_text)
-            fallback = True
-        elif cluster.importance_score < self._pplx_min_score:
-            # Importance gate: low-signal clusters don't warrant an API call
-            logger.debug(
-                "Cluster %d below importance threshold (%.2f < %.2f) — using extractive fallback",
-                cluster.cluster_id, cluster.importance_score, self._pplx_min_score,
-            )
-            summary = self._extractive_fallback(input_text)
-            fallback = True
-        else:
-            # Check and increment the per-run cap atomically
-            with self._pplx_call_lock:
-                if self._pplx_calls >= self._pplx_max_calls:
-                    logger.info(
-                        "Cluster %d: Perplexity cap (%d) reached — using extractive fallback",
-                        cluster.cluster_id, self._pplx_max_calls,
-                    )
-                    summary = self._extractive_fallback(input_text)
-                    fallback = True
-                else:
-                    self._pplx_calls += 1
-                    do_call = True
-
-            if not fallback:  # type: ignore[possibly-undefined]
-                summary, fallback = self._call_with_throttle_and_retry(
-                    cluster.cluster_id, input_text
-                )
+        summary, backend = self._route_summary(cluster, input_text)
 
         source_links: list[tuple[str, str]] = [
             (a.raw.source_name, a.raw.url)
@@ -339,31 +373,82 @@ class Summarizer:
             has_cross_lean_coverage=cluster.has_cross_lean_coverage,
             source_links=source_links,
             source_bias=source_bias,
-            fallback_used=fallback,
+            fallback_used=(backend == "extractive"),
+            summary_backend=backend,
         )
+
+    def _route_summary(self, cluster: StoryCluster, input_text: str) -> tuple[str, str]:
+        """Decide which backend to use and return (summary_text, backend_name).
+
+        Priority:
+          1. Perplexity  — if key present, score >= threshold, cap not reached
+          2. Local LLM   — all other cases where local model is available
+          3. Extractive  — last resort when no LLM is reachable
+        """
+        use_perplexity = False
+
+        if self._pplx_key and cluster.importance_score >= self._pplx_min_score:
+            with self._pplx_call_lock:
+                if self._pplx_calls < self._pplx_max_calls:
+                    self._pplx_calls += 1
+                    use_perplexity = True
+                else:
+                    logger.info(
+                        "Cluster %d: Perplexity cap (%d) reached — routing to local LLM",
+                        cluster.cluster_id, self._pplx_max_calls,
+                    )
+        elif self._pplx_key and cluster.importance_score < self._pplx_min_score:
+            logger.debug(
+                "Cluster %d: importance %.2f below threshold %.2f — routing to local LLM",
+                cluster.cluster_id, cluster.importance_score, self._pplx_min_score,
+            )
+
+        if use_perplexity:
+            summary, succeeded = self._call_with_throttle_and_retry(cluster.cluster_id, input_text)
+            if succeeded:
+                return summary, "perplexity"
+            # Perplexity failed after retries — fall through to local LLM
+            logger.warning(
+                "Cluster %d: Perplexity failed — falling through to local LLM",
+                cluster.cluster_id,
+            )
+
+        # Local LLM path
+        if self._local_llm.available():
+            try:
+                summary = self._local_llm.summarize(input_text, max_tokens=self._max_summary_tokens)
+                return summary, "local"
+            except Exception as exc:
+                logger.warning(
+                    "Cluster %d: local LLM failed (%s) — using extractive fallback",
+                    cluster.cluster_id, exc,
+                )
+
+        # Extractive last resort
+        return self._extractive_fallback(input_text), "extractive"
 
     def _call_with_throttle_and_retry(
         self, cluster_id: int, input_text: str
     ) -> tuple[str, bool]:
         """Acquire throttle lock, enforce inter-call delay, then call with retry.
 
-        The throttle lock serialises all workers so the delay is wall-clock
-        time between consecutive calls, not just per-worker.
+        Returns (summary, success). On failure returns (extractive_text, False)
+        so the caller can decide whether to fall through to local LLM.
         """
         with self._pplx_throttle_lock:
             time.sleep(self._pplx_call_delay)
             try:
                 summary = self._call_perplexity_with_retry(input_text)
-                return summary, False
+                return summary, True
             except Exception as exc:
                 logger.warning(
-                    "Perplexity failed for cluster %d after retries: %s — using extractive fallback",
+                    "Perplexity failed for cluster %d after retries: %s",
                     cluster_id, exc,
                 )
-                # Decrement counter so a retry run can use the slot
+                # Release the call slot so a future run can use it
                 with self._pplx_call_lock:
                     self._pplx_calls = max(0, self._pplx_calls - 1)
-                return self._extractive_fallback(input_text), True
+                return self._extractive_fallback(input_text), False
 
     def _call_perplexity_with_retry(self, input_text: str) -> str:
         """Call Perplexity with exponential backoff on 429 / 5xx responses.
@@ -384,17 +469,15 @@ class Summarizer:
                 if status == 429 or status >= 500:
                     if attempt < self._pplx_retry_attempts:
                         retry_after = exc.response.headers.get("Retry-After")
-                        if retry_after:
-                            wait = float(retry_after)
-                        else:
-                            wait = self._pplx_retry_base_delay * (2 ** attempt)
+                        wait = float(retry_after) if retry_after else (
+                            self._pplx_retry_base_delay * (2 ** attempt)
+                        )
                         logger.warning(
                             "Perplexity returned %d — retrying in %.1fs (attempt %d/%d)",
                             status, wait, attempt + 1, self._pplx_retry_attempts,
                         )
                         time.sleep(wait)
                         continue
-                # Non-retryable status or final attempt
                 raise
             except Exception as exc:
                 last_exc = exc
@@ -405,17 +488,10 @@ class Summarizer:
         payload = {
             "model": _PPLX_MODEL,
             "messages": [
-                {
-                    "role": "system",
-                    "content": (
-                        "You are a neutral news summarizer. Produce a concise 2-3 sentence "
-                        "summary containing only verifiable facts. Remove editorial framing, "
-                        "emotional language, and opinion. Use plain, direct language."
-                    ),
-                },
+                {"role": "system", "content": _NEUTRAL_SYSTEM_PROMPT},
                 {"role": "user", "content": input_text},
             ],
-            "max_tokens": 150,
+            "max_tokens": self._max_summary_tokens,
             "temperature": 0.1,
         }
         response = self._client.post(
@@ -443,6 +519,7 @@ class Summarizer:
         return " ".join(sentences[:3])
 
     def _fallback_summary(self, cluster: StoryCluster) -> SummarizedCluster:
+        """Emergency fallback used only when _summarize_cluster itself raises."""
         return SummarizedCluster(
             cluster_id=cluster.cluster_id,
             headline=cluster.representative_headline,
@@ -456,4 +533,5 @@ class Summarizer:
             source_links=[(a.raw.source_name, a.raw.url) for a in cluster.articles if a.raw.url],
             source_bias={a.raw.source_name: (a.raw.bias_lean or "unknown") for a in cluster.articles},
             fallback_used=True,
+            summary_backend="extractive",
         )
