@@ -5,6 +5,11 @@ Writes a JSON health log that can be inspected manually or by a future
 dashboard. Alerts via logging.WARNING when a source is consistently failing.
 
 Design: no external dependencies — plain Python stdlib only.
+
+Module-level helpers
+--------------------
+record_run() is a convenience wrapper so callers (e.g. scheduler.py) can
+log a completed digest run without instantiating SourceHealthMonitor directly.
 """
 
 from __future__ import annotations
@@ -21,6 +26,7 @@ from typing import Optional
 logger = logging.getLogger(__name__)
 
 HEALTH_LOG_PATH = Path(os.getenv("NEWSBOT_HEALTH_LOG", "logs/source_health.json"))
+RUN_LOG_PATH = Path(os.getenv("NEWSBOT_RUN_LOG", "logs/run_history.json"))
 FAILURE_ALERT_THRESHOLD = 3  # Consecutive failures before WARNING is logged
 
 
@@ -111,6 +117,49 @@ class SourceHealthMonitor:
                 self._state[name] = SourceHealth(**data)
         except (OSError, json.JSONDecodeError, TypeError) as exc:
             logger.warning("Could not load health log: %s. Starting fresh.", exc)
+
+
+def record_run(
+    period: str,
+    story_count: int,
+    elapsed_seconds: float,
+) -> None:
+    """Append a digest run entry to run_history.json.
+
+    This is a module-level convenience function so callers do not need to
+    instantiate SourceHealthMonitor. It is intentionally separate from
+    per-source health tracking — run history records whole-pipeline outcomes,
+    not individual source fetch results.
+
+    Args:
+        period:          Digest period label ('morning', 'evening', etc.).
+        story_count:     Number of story clusters delivered in this run.
+        elapsed_seconds: Wall-clock seconds from pipeline start to delivery.
+    """
+    entry = {
+        "timestamp": _now_iso(),
+        "period": period,
+        "story_count": story_count,
+        "elapsed_seconds": round(elapsed_seconds, 2),
+    }
+    RUN_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    history: list[dict] = []
+    if RUN_LOG_PATH.exists():
+        try:
+            with open(RUN_LOG_PATH, "r", encoding="utf-8") as f:
+                history = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            logger.warning("Could not read run history log — starting fresh.")
+    history.append(entry)
+    try:
+        with open(RUN_LOG_PATH, "w", encoding="utf-8") as f:
+            json.dump(history, f, indent=2)
+        logger.debug(
+            "run_history: period=%s stories=%d elapsed=%.1fs",
+            period, story_count, elapsed_seconds,
+        )
+    except OSError as exc:
+        logger.error("Failed to write run history log: %s", exc)
 
 
 def _now_iso() -> str:
