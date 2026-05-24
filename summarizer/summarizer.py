@@ -21,12 +21,28 @@ Failure modes
 The summarizer degrades gracefully:
   - Full text fetch fails  -> uses RSS summary
   - Brave enrichment fails -> skips enrichment, continues with available text
-  - LLM call fails         -> returns extractive fallback (first 3 sentences)
+  - LLM call fails or times out -> returns extractive fallback (first 3 sentences)
 A SummarizedCluster is always returned; nothing is silently dropped.
 
 Token budget
 ------------
 Input text is truncated to MAX_INPUT_CHARS (4000) before the LLM call.
+
+Concurrency
+-----------
+Clusters are summarized in parallel via ThreadPoolExecutor. The worker
+count is controlled by settings.summarizer.max_concurrent_summaries
+(default 5). Each future has an individual timeout as a final backstop
+against a single hanging cluster blocking the pool.
+
+Timeout configuration (settings.yaml)
+--------------------------------------
+summarizer:
+  request_timeout_seconds: 45       # httpx read/write timeout per LLM call
+  connect_timeout_seconds: 10       # httpx connect timeout
+  article_fetch_timeout_seconds: 15 # per-article fetch timeout
+  max_concurrent_summaries: 5       # ThreadPoolExecutor worker cap
+  cluster_timeout_seconds: 120      # per-cluster wall-clock timeout guard
 """
 
 from __future__ import annotations
@@ -34,6 +50,7 @@ from __future__ import annotations
 import logging
 import os
 import re
+from concurrent.futures import Future, ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 from dataclasses import dataclass
 from typing import Optional
 
@@ -48,6 +65,12 @@ MIN_CONTENT_CHARS = 200
 MAX_INPUT_CHARS = 4000
 _PPLX_API_URL = "https://api.perplexity.ai/chat/completions"
 _PPLX_MODEL = "sonar"
+
+# Defaults used when settings keys are absent
+_DEFAULT_READ_TIMEOUT = 45.0
+_DEFAULT_CONNECT_TIMEOUT = 10.0
+_DEFAULT_MAX_WORKERS = 5
+_DEFAULT_CLUSTER_TIMEOUT = 120.0
 
 
 @dataclass
@@ -70,7 +93,8 @@ class ArticleFetcher:
 
     def __init__(self, timeout: float = 15.0, user_agent: str = "NewsBot/1.0") -> None:
         self._client = httpx.Client(
-            timeout=timeout,
+            # Explicit Timeout object so both connect and read are bounded.
+            timeout=httpx.Timeout(connect=10.0, read=timeout, write=10.0, pool=5.0),
             headers={"User-Agent": user_agent},
             follow_redirects=True,
         )
@@ -97,7 +121,9 @@ class BraveSearchClient:
 
     def __init__(self) -> None:
         self._api_key = os.getenv("BRAVE_SEARCH_API_KEY", "")
-        self._client = httpx.Client(timeout=10.0)
+        self._client = httpx.Client(
+            timeout=httpx.Timeout(connect=5.0, read=10.0, write=5.0, pool=5.0)
+        )
 
     def search(self, query: str, count: int = 3) -> list[str]:
         """Return a list of snippet strings for the query, or [] on failure."""
@@ -133,11 +159,28 @@ class Summarizer:
     def __init__(self) -> None:
         self.settings = get_settings()
         self._pplx_key = os.getenv("PPLX_API_KEY", "")
-        timeout = self.settings["summarizer"]["request_timeout_seconds"]
+
+        s = self.settings["summarizer"]
+        read_timeout: float = float(s.get("request_timeout_seconds", _DEFAULT_READ_TIMEOUT))
+        connect_timeout: float = float(s.get("connect_timeout_seconds", _DEFAULT_CONNECT_TIMEOUT))
+        article_timeout: float = float(s.get("article_fetch_timeout_seconds", 15.0))
+        self._max_workers: int = int(s.get("max_concurrent_summaries", _DEFAULT_MAX_WORKERS))
+        self._cluster_timeout: float = float(s.get("cluster_timeout_seconds", _DEFAULT_CLUSTER_TIMEOUT))
+
         user_agent = self.settings["ingestion"]["user_agent"]
-        self._client = httpx.Client(timeout=timeout)
+
+        # Explicit Timeout object — flat float only sets the connect timeout
+        # in httpx, leaving the read phase unbounded (the source of hangs).
+        self._client = httpx.Client(
+            timeout=httpx.Timeout(
+                connect=connect_timeout,
+                read=read_timeout,
+                write=connect_timeout,
+                pool=5.0,
+            )
+        )
         self._article_fetcher = ArticleFetcher(
-            timeout=self.settings["summarizer"]["article_fetch_timeout_seconds"],
+            timeout=article_timeout,
             user_agent=user_agent,
         )
         self._brave = BraveSearchClient()
@@ -157,34 +200,64 @@ class Summarizer:
 
             with Summarizer() as s:
                 results = s.summarize_all(clusters)
-
-        Or with explicit try/finally:
-
-            summarizer = Summarizer()
-            try:
-                results = summarizer.summarize_all(clusters)
-            finally:
-                summarizer.close()
         """
         self._client.close()
         self._article_fetcher.close()
         self._brave.close()
 
     def summarize_all(self, clusters: list[StoryCluster]) -> list[SummarizedCluster]:
-        """Summarize every cluster. Returns results in input order."""
-        results = []
-        for cluster in clusters:
-            try:
-                results.append(self._summarize_cluster(cluster))
-            except Exception as exc:
-                logger.error("Summarization failed for cluster %d: %s", cluster.cluster_id, exc)
-                results.append(self._fallback_summary(cluster))
-        return results
+        """Summarize every cluster in parallel. Returns results in input order.
+
+        Uses a ThreadPoolExecutor bounded by settings.summarizer.max_concurrent_summaries
+        (default 5) so Perplexity calls run concurrently rather than serially.
+        Each future has an individual wall-clock deadline
+        (settings.summarizer.cluster_timeout_seconds, default 120 s) so a
+        single slow or hanging cluster cannot block the entire run.
+        """
+        results: list[Optional[SummarizedCluster]] = [None] * len(clusters)
+
+        with ThreadPoolExecutor(max_workers=self._max_workers) as pool:
+            future_to_index: dict[Future[SummarizedCluster], int] = {
+                pool.submit(self._summarize_cluster_safe, cluster): idx
+                for idx, cluster in enumerate(clusters)
+            }
+            for future, idx in future_to_index.items():
+                cluster = clusters[idx]
+                try:
+                    results[idx] = future.result(timeout=self._cluster_timeout)
+                except FutureTimeoutError:
+                    logger.error(
+                        "Cluster %d timed out after %.0fs — using extractive fallback",
+                        cluster.cluster_id,
+                        self._cluster_timeout,
+                    )
+                    results[idx] = self._fallback_summary(cluster)
+                except Exception as exc:
+                    logger.error(
+                        "Cluster %d raised unexpected error: %s",
+                        cluster.cluster_id,
+                        exc,
+                    )
+                    results[idx] = self._fallback_summary(cluster)
+
+        # Filter out any None slots (should never occur, but be defensive)
+        return [r for r in results if r is not None]
+
+    def _summarize_cluster_safe(self, cluster: StoryCluster) -> SummarizedCluster:
+        """Wrapper that guarantees a SummarizedCluster is always returned."""
+        try:
+            return self._summarize_cluster(cluster)
+        except Exception as exc:
+            logger.error("Summarization failed for cluster %d: %s", cluster.cluster_id, exc)
+            return self._fallback_summary(cluster)
 
     def _summarize_cluster(self, cluster: StoryCluster) -> SummarizedCluster:
         input_text = self._build_input_text(cluster)
 
-        if cluster.importance_score >= self.settings["summarizer"].get("brave_enrich_threshold", 0.7):
+        enrich_threshold = float(
+            self.settings["summarizer"].get("brave_enrich_threshold", 0.7)
+        )
+        if cluster.importance_score >= enrich_threshold:
             snippets = self._brave.search(cluster.representative_headline, count=3)
             if snippets:
                 input_text += "\n\nADDITIONAL CONTEXT:\n" + "\n".join(snippets)
@@ -196,7 +269,11 @@ class Summarizer:
                 summary = self._call_perplexity(input_text)
                 fallback = False
             except Exception as exc:
-                logger.warning("LLM summarization failed for cluster %d: %s", cluster.cluster_id, exc)
+                logger.warning(
+                    "LLM summarization failed for cluster %d: %s",
+                    cluster.cluster_id,
+                    exc,
+                )
                 summary = self._extractive_fallback(input_text)
                 fallback = True
         else:
@@ -221,7 +298,9 @@ class Summarizer:
         for article in cluster.articles:
             full_text = self._article_fetcher.fetch(article.raw.url)
             text = full_text if full_text else article.raw.summary
-            parts.append(f"SOURCE: {article.raw.source_name}\n{text}")
+            # Strip source name from prompt to avoid priming LLM with
+            # outlet identity (see code review item #9)
+            parts.append(text)
         return "\n\n---\n\n".join(parts)
 
     def _call_perplexity(self, input_text: str) -> str:
