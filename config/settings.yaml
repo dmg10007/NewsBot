@@ -39,6 +39,7 @@ ingestion:
   cache_ttl_seconds: 3600       # 1 hour — don't re-fetch the same feed
   user_agent: "NewsBot/1.0 (personal news aggregator; contact via github)"
   max_articles_per_source: 20  # Cap per source per run to avoid noise
+  request_delay_seconds: 1.5   # Inter-request delay (seconds) between source fetches
 
 deduplication:
   url_hash: true
@@ -50,7 +51,9 @@ clustering:
   min_sources_to_report: 1     # Report even single-source stories (local)
   cross_tier_boost: true       # Boost clusters that appear in multiple tiers
 
-bias_detection:
+# Key was previously 'bias_detection' — renamed to 'bias' to match all Python
+# module references (settings["bias"]). No code changes required.
+bias:
   always_run_lexicon: true
   always_run_sentiment: true
   llm_escalation_threshold: 0.35   # Escalate if sentiment variance > this across sources
@@ -73,8 +76,20 @@ delivery:
     max_recipients: 5
     subject_morning: "NewsBot Morning Briefing — {date}"
     subject_evening: "NewsBot Evening Briefing — {date}"
+    bias_tag_colors:
+      left:         "#1565c0"
+      center-left:  "#1976d2"
+      center:       "#388e3c"
+      center-right: "#e64a19"
+      right:        "#b71c1c"
+      unknown:      "#757575"
   telegram:
     enabled: false   # Set to true and add NEWSBOT_TELEGRAM_TOKEN + NEWSBOT_TELEGRAM_CHAT_ID in .env
+
+scheduler:
+  schedule:
+    morning: "0 6 * * *"    # 6:00 AM Eastern
+    evening: "0 18 * * *"   # 6:00 PM Eastern
 
 scoring:
   # Story importance weights — used to rank within topic buckets
