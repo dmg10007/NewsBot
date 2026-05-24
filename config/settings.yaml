@@ -2,19 +2,20 @@
 # Sensitive values (API keys, email addresses) must be set in .env
 # This file contains only non-sensitive configuration.
 #
-# Key naming contract (settings.yaml top-level key → Python module that reads it):
-#   app           → config/loader.py
-#   schedule      → scheduler/scheduler.py (digest times)
-#   topics        → scheduler/scheduler.py (story caps)
-#   geography     → ingestion/pipeline.py
-#   ingestion     → ingestion/fetcher.py, ingestion/scraper.py
-#   deduplication → ingestion/deduplicator.py
-#   clustering    → clustering/clusterer.py
-#   bias          → bias/llm_analyzer.py, bias/framing.py
-#   summarizer    → summarizer/summarizer.py
-#   delivery      → scheduler/scheduler.py, delivery/email_renderer.py
-#   scheduler     → scheduler/scheduler.py (cron expressions)
-#   scoring       → scheduler/scheduler.py (story ranking)
+# Key naming contract (settings.yaml top-level key -> Python module that reads it):
+#   app           -> config/loader.py
+#   schedule      -> scheduler/scheduler.py (digest times)
+#   topics        -> scheduler/scheduler.py (story caps)
+#   geography     -> ingestion/pipeline.py
+#   ingestion     -> ingestion/fetcher.py, ingestion/scraper.py
+#   deduplication -> ingestion/deduplicator.py
+#   clustering    -> clustering/clusterer.py
+#   bias          -> bias/llm_analyzer.py, bias/framing.py
+#   summarizer    -> summarizer/summarizer.py
+#   delivery      -> scheduler/scheduler.py, delivery/email_sender.py,
+#                    delivery/email_renderer.py
+#   scheduler     -> scheduler/scheduler.py (cron expressions)
+#   scoring       -> scheduler/scheduler.py (story ranking)
 
 app:
   name: NewsBot
@@ -44,7 +45,7 @@ geography:
   national: true
   state: north_carolina
   local: lee_county_nc
-  local_boost: 1.5  # Scoring multiplier for local stories
+  local_boost: 1.5
 
 ingestion:
   request_timeout_seconds: 15
@@ -53,7 +54,7 @@ ingestion:
   cache_ttl_seconds: 3600
   user_agent: "NewsBot/1.0 (personal news aggregator; contact via github)"
   max_articles_per_source: 20
-  request_delay_seconds: 1.5  # Inter-request delay between source fetches
+  request_delay_seconds: 1.5
 
 deduplication:
   url_hash: true
@@ -65,34 +66,42 @@ clustering:
   min_sources_to_report: 1
   cross_tier_boost: true
 
-# Read by bias/llm_analyzer.py and bias/framing.py as settings["bias"]
 bias:
   always_run_lexicon: true
   always_run_sentiment: true
   llm_escalation_threshold: 0.35
-  llm_provider: perplexity         # perplexity | local
+  llm_provider: perplexity
   llm_model: sonar
   llm_fallback: local
   llm_fallback_model: llama3
-  max_llm_calls_per_run: 20        # Set to 0 to disable LLM analysis entirely
+  max_llm_calls_per_run: 20
 
-# Read by summarizer/summarizer.py as settings["summarizer"]
-# Previously named 'summarization' — renamed to match Python module references.
 summarizer:
-  provider: local                       # local | perplexity
+  provider: local
   model: llama3
   max_summary_tokens: 150
-  neutral_prompt_version: v1            # Bump to invalidate cached prompts
-  request_timeout_seconds: 60.0         # Timeout for LLM API calls (seconds)
-  article_fetch_timeout_seconds: 15.0   # Timeout for full-text article fetches
-  brave_enrich_threshold: 0.7           # Enrich with Brave Search if importance >= this
+  neutral_prompt_version: v1
+  request_timeout_seconds: 60.0
+  article_fetch_timeout_seconds: 15.0
+  brave_enrich_threshold: 0.7
 
-# Read by scheduler.py as settings["delivery"].get(period, {})
-# Each period key controls which channels fire for that digest.
-# Channel credentials (API keys, addresses) live in .env — not here.
+# delivery structure:
+#
+#   delivery.<period>.email.enabled   -- scheduler.py per-period on/off switch
+#   delivery.<period>.telegram.enabled
+#
+#   delivery.email.*                  -- email_sender.py + email_renderer.py
+#   delivery.telegram.*               -- reserved for future telegram config
+#
+# Python access pattern (email_sender.py):
+#   settings["delivery"]["email"]["max_recipients"]
+#   settings["delivery"]["email"]["subject_morning"]
+# Python access pattern (email_renderer.py):
+#   settings["delivery"]["email"]["bias_tag_colors"]
+# Python access pattern (scheduler.py):
+#   settings["delivery"].get(period, {}).get("email", {}).get("enabled")
 delivery:
-  # Per-period delivery switches — set enabled: false to silence a channel
-  # for a specific period without disabling it globally.
+  # Per-period on/off switches
   morning:
     email:
       enabled: true
@@ -109,27 +118,27 @@ delivery:
     telegram:
       enabled: false
 
-  # Shared channel configuration (read by EmailSender / TelegramSender directly)
-  channels:
-    email:
-      max_recipients: 5
-      subject_morning: "NewsBot Morning Briefing — {date}"
-      subject_evening: "NewsBot Evening Briefing — {date}"
-      bias_tag_colors:
-        left:         "#1565c0"
-        center-left:  "#1976d2"
-        center:       "#388e3c"
-        center-right: "#e64a19"
-        right:        "#b71c1c"
-        unknown:      "#757575"
-    telegram:
-      parse_mode: HTML   # HTML | Markdown
+  # Shared email config -- read by email_sender.py and email_renderer.py
+  email:
+    max_recipients: 5
+    subject_morning: "NewsBot Morning Briefing - {date}"
+    subject_evening: "NewsBot Evening Briefing - {date}"
+    bias_tag_colors:
+      left:         "#1565c0"
+      center-left:  "#1976d2"
+      center:       "#388e3c"
+      center-right: "#e64a19"
+      right:        "#b71c1c"
+      unknown:      "#757575"
 
-# Cron expressions for start_scheduler() — read as settings["scheduler"]["schedule"]
+  # Shared telegram config -- read by telegram_bot.py (currently uses env vars only)
+  telegram:
+    parse_mode: HTML
+
 scheduler:
   schedule:
-    morning: "0 6 * * *"    # 6:00 AM Eastern
-    evening: "0 18 * * *"   # 6:00 PM Eastern
+    morning: "0 6 * * *"
+    evening: "0 18 * * *"
 
 scoring:
   weights:
@@ -138,5 +147,3 @@ scoring:
     state_tier: 1.2
     national_tier: 1.0
     recency_decay: 0.05
-  # source_credibility weighting handled inline in scheduler.py:
-  # {high: 1.0, medium: 0.7, low: 0.4}
