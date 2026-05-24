@@ -96,23 +96,20 @@ ingestion:
 
 deduplication:
   url_hash: true
-  # Raised from 0.92 → 0.95 to catch more wire-syndicated near-duplicates
+  # Raised from 0.92 -> 0.95 to catch more wire-syndicated near-duplicates
   # before they enter clustering and inflate cluster count.
   headline_similarity_threshold: 0.95
 
 clustering:
   model: all-MiniLM-L6-v2
-  # Raised from 0.65 → 0.82. Articles must now be substantially more alike
+  # Raised from 0.65 -> 0.82. Articles must now be substantially more alike
   # to be grouped. This is the primary lever for reducing cluster count.
-  # 0.65 was too permissive — loosely related stories were merging into
-  # many small clusters instead of consolidating around the same event.
   similarity_threshold: 0.82
-  # Reduced from 24 → 12 hours. Prevents stale articles from a prior run
+  # Reduced from 24 -> 12 hours. Prevents stale articles from a prior run
   # from merging with fresh ones and creating cross-period cluster noise.
   max_age_delta_hours: 12
-  # Raised from 1 → 2. Singleton clusters (1 article, 1 source) are almost
+  # Raised from 1 -> 2. Singleton clusters (1 article, 1 source) are almost
   # always noise — wire stubs, opinion pieces, or hyper-local one-offs.
-  # Requiring at least 2 sources trims output without losing real coverage.
   min_sources_to_report: 2
   cross_tier_boost: true
 
@@ -124,9 +121,8 @@ bias:
   llm_model: sonar
   llm_fallback: local
   llm_fallback_model: llama3
-  # Perplexity API call cap per run. After this many Perplexity calls,
+  # Perplexity API call cap per run. After this many calls,
   # remaining clusters are routed to the local model automatically.
-  # Set skip_after_cap: true to revert to the old skip behaviour.
   max_llm_calls_per_run: 20
   skip_after_cap: false
 
@@ -139,8 +135,28 @@ summarizer:
   connect_timeout_seconds: 10
   article_fetch_timeout_seconds: 15.0
   brave_enrich_threshold: 0.7
-  max_concurrent_summaries: 5
   cluster_timeout_seconds: 120
+
+  # --- Perplexity rate-limit controls ---
+  # Reduced from 5 -> 3. Fewer parallel workers = narrower burst window.
+  max_concurrent_summaries: 3
+  # Enforced pause between consecutive Perplexity calls across all workers.
+  # 1.2s keeps throughput reasonable while staying under typical RPM limits.
+  pplx_call_delay_seconds: 1.2
+  # Hard cap on Perplexity calls per digest run. Clusters over the cap
+  # receive the extractive fallback (first 3 sentences). Mirrors the
+  # bias module's max_llm_calls_per_run behaviour.
+  pplx_max_calls_per_run: 15
+  # Clusters below this importance score skip Perplexity entirely.
+  # Extractive fallback is adequate for low-signal stories.
+  # Range 0.0-1.0; set to 0.0 to disable gating.
+  pplx_min_importance_score: 0.3
+  # Retry settings for 429 / transient errors. The summarizer will retry
+  # up to pplx_retry_attempts times before falling back to extractive.
+  # Delay follows exponential backoff: pplx_retry_base_delay * 2^attempt.
+  # Respects Retry-After header when present.
+  pplx_retry_attempts: 3
+  pplx_retry_base_delay: 2.0
 
 # delivery structure:
 #   delivery.<period>.email.enabled   -- per-period on/off switch

@@ -19,9 +19,11 @@ as a context manager:
 Failure modes
 -------------
 The summarizer degrades gracefully:
-  - Full text fetch fails  -> uses RSS summary
-  - Brave enrichment fails -> skips enrichment, continues with available text
-  - LLM call fails or times out -> returns extractive fallback (first 3 sentences)
+  - Full text fetch fails       -> uses RSS summary
+  - Brave enrichment fails      -> skips enrichment, continues
+  - LLM call fails after retry  -> extractive fallback (first 3 sentences)
+  - Per-run cap exceeded        -> extractive fallback
+  - Importance score too low    -> extractive fallback (no API call made)
 A SummarizedCluster is always returned; nothing is silently dropped.
 
 Token budget
@@ -32,17 +34,37 @@ Concurrency
 -----------
 Clusters are summarized in parallel via ThreadPoolExecutor. The worker
 count is controlled by settings.summarizer.max_concurrent_summaries
-(default 5). Each future has an individual timeout as a final backstop
+(default 3). Each future has an individual timeout as a final backstop
 against a single hanging cluster blocking the pool.
+
+Perplexity rate-limit strategy
+-------------------------------
+Three overlapping guards prevent 429 errors:
+
+  1. _pplx_throttle_lock  — a threading.Lock serialising the inter-call
+     delay so parallel workers queue behind each other rather than firing
+     simultaneously.
+  2. _pplx_calls / pplx_max_calls_per_run  — hard cap; clusters over the
+     cap receive extractive fallback immediately.
+  3. _call_perplexity_with_retry()  — catches 429 (and 5xx) responses and
+     retries with exponential backoff before giving up. Respects the
+     Retry-After header when present.
+  4. Importance gate  — clusters below pplx_min_importance_score never
+     reach the API; extractive fallback is adequate for low-signal stories.
 
 Timeout configuration (settings.yaml)
 --------------------------------------
 summarizer:
-  request_timeout_seconds: 45       # httpx read/write timeout per LLM call
-  connect_timeout_seconds: 10       # httpx connect timeout
-  article_fetch_timeout_seconds: 15 # per-article fetch timeout
-  max_concurrent_summaries: 5       # ThreadPoolExecutor worker cap
-  cluster_timeout_seconds: 120      # per-cluster wall-clock timeout guard
+  request_timeout_seconds: 45
+  connect_timeout_seconds: 10
+  article_fetch_timeout_seconds: 15
+  max_concurrent_summaries: 3
+  cluster_timeout_seconds: 120
+  pplx_call_delay_seconds: 1.2
+  pplx_max_calls_per_run: 15
+  pplx_min_importance_score: 0.3
+  pplx_retry_attempts: 3
+  pplx_retry_base_delay: 2.0
 """
 
 from __future__ import annotations
@@ -50,6 +72,8 @@ from __future__ import annotations
 import logging
 import os
 import re
+import threading
+import time
 from concurrent.futures import Future, ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 from dataclasses import dataclass, field
 from typing import Optional
@@ -68,8 +92,13 @@ _PPLX_MODEL = "sonar"
 
 _DEFAULT_READ_TIMEOUT = 45.0
 _DEFAULT_CONNECT_TIMEOUT = 10.0
-_DEFAULT_MAX_WORKERS = 5
+_DEFAULT_MAX_WORKERS = 3
 _DEFAULT_CLUSTER_TIMEOUT = 120.0
+_DEFAULT_PPLX_DELAY = 1.2
+_DEFAULT_PPLX_MAX_CALLS = 15
+_DEFAULT_PPLX_MIN_SCORE = 0.3
+_DEFAULT_PPLX_RETRY_ATTEMPTS = 3
+_DEFAULT_PPLX_RETRY_BASE_DELAY = 2.0
 
 
 @dataclass
@@ -85,7 +114,6 @@ class SummarizedCluster:
     source_count: int
     has_cross_lean_coverage: bool
     # (source_name, article_url) pairs — one per article in the cluster.
-    # Used by the email renderer to build linked source chips.
     source_links: list[tuple[str, str]] = field(default_factory=list)
     # {source_name: lean_label} map for bias color rendering in the email.
     source_bias: dict[str, str] = field(default_factory=dict)
@@ -170,6 +198,19 @@ class Summarizer:
         self._max_workers: int = int(s.get("max_concurrent_summaries", _DEFAULT_MAX_WORKERS))
         self._cluster_timeout: float = float(s.get("cluster_timeout_seconds", _DEFAULT_CLUSTER_TIMEOUT))
 
+        # Rate-limit controls
+        self._pplx_call_delay: float = float(s.get("pplx_call_delay_seconds", _DEFAULT_PPLX_DELAY))
+        self._pplx_max_calls: int = int(s.get("pplx_max_calls_per_run", _DEFAULT_PPLX_MAX_CALLS))
+        self._pplx_min_score: float = float(s.get("pplx_min_importance_score", _DEFAULT_PPLX_MIN_SCORE))
+        self._pplx_retry_attempts: int = int(s.get("pplx_retry_attempts", _DEFAULT_PPLX_RETRY_ATTEMPTS))
+        self._pplx_retry_base_delay: float = float(s.get("pplx_retry_base_delay", _DEFAULT_PPLX_RETRY_BASE_DELAY))
+
+        # Thread-safe call counter and throttle lock
+        self._pplx_calls: int = 0
+        self._pplx_call_lock: threading.Lock = threading.Lock()
+        # Shared lock that serialises the inter-call delay across workers
+        self._pplx_throttle_lock: threading.Lock = threading.Lock()
+
         user_agent = self.settings["ingestion"]["user_agent"]
 
         self._client = httpx.Client(
@@ -243,22 +284,39 @@ class Summarizer:
 
         input_text = input_text[:MAX_INPUT_CHARS]
 
-        if self._pplx_key:
-            try:
-                summary = self._call_perplexity(input_text)
-                fallback = False
-            except Exception as exc:
-                logger.warning(
-                    "LLM summarization failed for cluster %d: %s",
-                    cluster.cluster_id, exc,
-                )
-                summary = self._extractive_fallback(input_text)
-                fallback = True
-        else:
+        summary: str
+        fallback: bool
+
+        if not self._pplx_key:
             summary = self._extractive_fallback(input_text)
             fallback = True
+        elif cluster.importance_score < self._pplx_min_score:
+            # Importance gate: low-signal clusters don't warrant an API call
+            logger.debug(
+                "Cluster %d below importance threshold (%.2f < %.2f) — using extractive fallback",
+                cluster.cluster_id, cluster.importance_score, self._pplx_min_score,
+            )
+            summary = self._extractive_fallback(input_text)
+            fallback = True
+        else:
+            # Check and increment the per-run cap atomically
+            with self._pplx_call_lock:
+                if self._pplx_calls >= self._pplx_max_calls:
+                    logger.info(
+                        "Cluster %d: Perplexity cap (%d) reached — using extractive fallback",
+                        cluster.cluster_id, self._pplx_max_calls,
+                    )
+                    summary = self._extractive_fallback(input_text)
+                    fallback = True
+                else:
+                    self._pplx_calls += 1
+                    do_call = True
 
-        # Build source_links and source_bias for the renderer
+            if not fallback:  # type: ignore[possibly-undefined]
+                summary, fallback = self._call_with_throttle_and_retry(
+                    cluster.cluster_id, input_text
+                )
+
         source_links: list[tuple[str, str]] = [
             (a.raw.source_name, a.raw.url)
             for a in cluster.articles
@@ -284,14 +342,64 @@ class Summarizer:
             fallback_used=fallback,
         )
 
-    def _build_input_text(self, cluster: StoryCluster) -> str:
-        parts = []
-        for article in cluster.articles:
-            full_text = self._article_fetcher.fetch(article.raw.url)
-            text = full_text if full_text else article.raw.summary
-            # Source names excluded from prompt — see code review item #9
-            parts.append(text or "")
-        return "\n\n---\n\n".join(parts)
+    def _call_with_throttle_and_retry(
+        self, cluster_id: int, input_text: str
+    ) -> tuple[str, bool]:
+        """Acquire throttle lock, enforce inter-call delay, then call with retry.
+
+        The throttle lock serialises all workers so the delay is wall-clock
+        time between consecutive calls, not just per-worker.
+        """
+        with self._pplx_throttle_lock:
+            time.sleep(self._pplx_call_delay)
+            try:
+                summary = self._call_perplexity_with_retry(input_text)
+                return summary, False
+            except Exception as exc:
+                logger.warning(
+                    "Perplexity failed for cluster %d after retries: %s — using extractive fallback",
+                    cluster_id, exc,
+                )
+                # Decrement counter so a retry run can use the slot
+                with self._pplx_call_lock:
+                    self._pplx_calls = max(0, self._pplx_calls - 1)
+                return self._extractive_fallback(input_text), True
+
+    def _call_perplexity_with_retry(self, input_text: str) -> str:
+        """Call Perplexity with exponential backoff on 429 / 5xx responses.
+
+        Retries up to self._pplx_retry_attempts times. On a 429, respects
+        the Retry-After header if present; otherwise uses exponential backoff
+        starting at pplx_retry_base_delay seconds.
+
+        Raises the last exception if all attempts are exhausted.
+        """
+        last_exc: Exception = RuntimeError("No attempts made")
+        for attempt in range(self._pplx_retry_attempts + 1):
+            try:
+                return self._call_perplexity(input_text)
+            except httpx.HTTPStatusError as exc:
+                last_exc = exc
+                status = exc.response.status_code
+                if status == 429 or status >= 500:
+                    if attempt < self._pplx_retry_attempts:
+                        retry_after = exc.response.headers.get("Retry-After")
+                        if retry_after:
+                            wait = float(retry_after)
+                        else:
+                            wait = self._pplx_retry_base_delay * (2 ** attempt)
+                        logger.warning(
+                            "Perplexity returned %d — retrying in %.1fs (attempt %d/%d)",
+                            status, wait, attempt + 1, self._pplx_retry_attempts,
+                        )
+                        time.sleep(wait)
+                        continue
+                # Non-retryable status or final attempt
+                raise
+            except Exception as exc:
+                last_exc = exc
+                raise
+        raise last_exc
 
     def _call_perplexity(self, input_text: str) -> str:
         payload = {
@@ -320,6 +428,15 @@ class Summarizer:
         )
         response.raise_for_status()
         return response.json()["choices"][0]["message"]["content"].strip()
+
+    def _build_input_text(self, cluster: StoryCluster) -> str:
+        parts = []
+        for article in cluster.articles:
+            full_text = self._article_fetcher.fetch(article.raw.url)
+            text = full_text if full_text else article.raw.summary
+            # Source names excluded from prompt — see code review item #9
+            parts.append(text or "")
+        return "\n\n---\n\n".join(parts)
 
     def _extractive_fallback(self, text: str) -> str:
         sentences = re.split(r'(?<=[.!?])\s+', text.strip())
