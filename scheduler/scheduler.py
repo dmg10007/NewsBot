@@ -34,7 +34,7 @@ from bias.framing import FramingAnalyzer
 from clustering.clusterer import StoryClusterer
 from config.loader import get_settings, get_sources
 from delivery.email_sender import EmailSender
-from delivery.telegram_sender import TelegramSender
+from delivery.telegram_bot import TelegramSender  # was incorrectly: delivery.telegram_sender
 from ingestion.pipeline import ingest_all_sources
 from monitoring.health_check import record_run
 from parsing.extractor import ArticleExtractor
