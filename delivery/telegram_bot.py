@@ -18,7 +18,7 @@ import os
 from datetime import datetime
 from typing import Literal
 
-from summarizer.summarizer import SummaryResult
+from summarizer.summarizer import SummarizedCluster
 
 logger = logging.getLogger(__name__)
 
@@ -37,7 +37,34 @@ class TelegramSender:
         self._chat_id = os.getenv("NEWSBOT_TELEGRAM_CHAT_ID", "")
         self._enabled = bool(self._token and self._chat_id)
 
-    def send(self, summaries: list[SummaryResult], period: str, run_date: datetime) -> bool:
+    def send_digest(self, summaries: list[SummarizedCluster], period: str) -> bool:
+        """Send a full digest as chunked Telegram messages."""
+        return self._send(summaries, period=period, run_date=datetime.now())
+
+    def send_alert(self, message: str) -> None:
+        """Send a plain-text alert message (e.g. failure notification)."""
+        if not self._enabled:
+            logger.debug("Telegram not configured — skipping alert")
+            return
+        try:
+            import telegram
+            import asyncio
+
+            async def _send() -> None:
+                bot = telegram.Bot(token=self._token)
+                await bot.send_message(
+                    chat_id=self._chat_id,
+                    text=message,
+                    disable_web_page_preview=True,
+                )
+
+            asyncio.run(_send())
+        except ImportError:
+            logger.warning("python-telegram-bot not installed. Run: pip install python-telegram-bot>=21.0")
+        except Exception as exc:
+            logger.error("Telegram alert failed: %s", exc)
+
+    def _send(self, summaries: list[SummarizedCluster], period: str, run_date: datetime) -> bool:
         if not self._enabled:
             logger.debug("Telegram delivery is disabled or unconfigured. Skipping.")
             return False
@@ -50,7 +77,7 @@ class TelegramSender:
             return False
 
         period_label = "\U0001f305 Morning" if period == "morning" else "\U0001f307 Evening"
-        date_str = run_date.strftime("%b %-d, %Y")
+        date_str = run_date.strftime("%b %d, %Y")
         messages = self._build_messages(summaries, period_label, date_str)
 
         async def _send_all() -> None:
@@ -71,12 +98,18 @@ class TelegramSender:
             logger.error("Telegram send failed: %s", exc)
             return False
 
-    def _build_messages(self, summaries: list[SummaryResult], period_label: str, date_str: str) -> list[str]:
+    def _build_messages(
+        self,
+        summaries: list[SummarizedCluster],
+        period_label: str,
+        date_str: str,
+    ) -> list[str]:
         header = f"<b>NewsBot {period_label} Briefing</b> \u2014 {date_str}\n"
-        grouped: dict[str, list[SummaryResult]] = {t: [] for t in TOPIC_ORDER}
+        grouped: dict[str, list[SummarizedCluster]] = {t: [] for t in TOPIC_ORDER}
         for s in summaries:
-            topic = s.topic if s.topic in grouped else "current_events"
-            grouped[topic].append(s)
+            topic = s.tiers[0] if s.tiers else "current_events"
+            bucket = topic if topic in grouped else "current_events"
+            grouped[bucket].append(s)
 
         chunks: list[str] = []
         current = header
@@ -88,7 +121,7 @@ class TelegramSender:
             section_header = f"\n<b>{emoji} {topic.replace('_', ' ').title()}</b>\n"
             for s in stories:
                 source_note = f"({s.source_count} source{'s' if s.source_count > 1 else ''})"
-                entry = f"\n\u2022 <b>{s.representative_headline}</b> {source_note}\n{s.summary}\n"
+                entry = f"\n\u2022 <b>{s.headline}</b> {source_note}\n{s.summary}\n"
                 if len(current) + len(section_header) + len(entry) > TELEGRAM_MAX_CHARS:
                     chunks.append(current)
                     current = entry
