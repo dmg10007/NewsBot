@@ -10,9 +10,16 @@ called by start_scheduler() to make this fail-fast guarantee explicit.
 Failure alerting
 ----------------
 If run_digest() raises an unhandled exception, _send_failure_alert() is
-called before re-raising. It attempts to deliver an alert via TelegramSender
-first, then EmailSender as fallback. Operators should not need to tail logs
-to discover a broken run.
+called before re-raising. It attempts to deliver an alert via TelegramSender.
+EmailSender is NOT used for alerts because it requires fully-rendered HTML
+and a valid digest period — it is not designed for plain-text error strings.
+
+Email delivery
+--------------
+Email digests are a two-step process:
+  1. EmailRenderer.render(summaries, period) -> HTML string
+  2. EmailSender.send(html, period, run_date) -> bool
+Do not call EmailSender directly with summaries — it does not accept them.
 
 Summarizer lifecycle
 --------------------
@@ -33,10 +40,11 @@ from bias.llm_analyzer import LLMAnalyzer
 from bias.framing import FramingAnalyzer
 from clustering.clusterer import StoryClusterer
 from config.loader import get_settings, get_sources
+from delivery.email_renderer import EmailRenderer
 from delivery.email_sender import EmailSender
-from delivery.telegram_bot import TelegramSender  # was incorrectly: delivery.telegram_sender
+from delivery.telegram_bot import TelegramSender
 from ingestion.pipeline import ingest_all_sources
-from monitoring.health_check import record_run
+from monitoring.health import record_run          # was: monitoring.health_check (wrong module name)
 from parsing.extractor import ArticleExtractor
 from summarizer.summarizer import Summarizer
 
@@ -51,10 +59,6 @@ def _validate_imports() -> None:
     All imports are already at module level; this function exists as an
     explicit fast-fail contract and documents which modules are required.
     """
-    # All required names are already imported at module level above.
-    # If any were missing, the process would have already crashed on import.
-    # This function serves as a readable checklist and can be extended with
-    # runtime capability checks (e.g. model file present, API key set).
     settings = get_settings()
     if not settings.get("scheduler"):
         raise RuntimeError("settings.yaml is missing the [scheduler] section")
@@ -62,7 +66,12 @@ def _validate_imports() -> None:
 
 
 def _send_failure_alert(period: str, exc: Exception) -> None:
-    """Best-effort failure alert via Telegram then Email.
+    """Best-effort failure alert via Telegram.
+
+    EmailSender is intentionally excluded here: it requires a fully-rendered
+    HTML digest and a valid period label — it is not a general-purpose alert
+    channel. TelegramSender.send_alert() accepts a plain-text string and is
+    the correct delivery path for operational alerts.
 
     Swallows any exception raised by the delivery layer so it never masks
     the original error that triggered the alert.
@@ -76,15 +85,8 @@ def _send_failure_alert(period: str, exc: Exception) -> None:
     try:
         TelegramSender().send_alert(message)
         logger.info("Failure alert sent via Telegram")
-        return
     except Exception as telegram_exc:
         logger.warning("Telegram alert failed: %s", telegram_exc)
-
-    try:
-        EmailSender().send_alert(message)
-        logger.info("Failure alert sent via Email")
-    except Exception as email_exc:
-        logger.warning("Email alert also failed: %s", email_exc)
 
 
 def run_digest(period: str = "morning") -> None:
@@ -161,7 +163,10 @@ def _run_digest_inner(period: str) -> None:
     if delivery_settings.get("telegram", {}).get("enabled"):
         TelegramSender().send_digest(summaries, period=period)
     if delivery_settings.get("email", {}).get("enabled"):
-        EmailSender().send_digest(summaries, period=period)
+        # EmailSender.send() requires rendered HTML — it does not accept
+        # summaries directly. EmailRenderer.render() must be called first.
+        html = EmailRenderer().render(summaries, period=period)
+        EmailSender().send(html, period=period, run_date=start_time)
 
     elapsed = (datetime.now(timezone.utc) - start_time).total_seconds()
     logger.info("Digest complete in %.1fs — %d stories delivered", elapsed, len(summaries))
