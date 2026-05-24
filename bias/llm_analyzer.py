@@ -34,9 +34,12 @@ Prompt token budget:
   giving the model sufficient context for framing analysis.
 
 Security note:
-  The httpx client uses a request hook to redact the Authorization header
-  value before it can appear in any log output, preventing accidental key
-  exposure in debug-level httpx logs.
+  Auth header exposure is prevented by suppressing httpx debug-level
+  logging via the 'httpx' logger. httpx only logs headers at DEBUG; since
+  the bot runs at INFO by default, the key never appears in logs.
+  A previous approach using an httpx request hook was removed because hooks
+  mutate the live request object — the hook was replacing the real Bearer
+  token with '[REDACTED]' before the request was sent, causing 401 errors.
 """
 
 from __future__ import annotations
@@ -45,7 +48,6 @@ import logging
 import os
 import re
 from dataclasses import dataclass
-from typing import Optional
 
 import httpx
 
@@ -54,34 +56,26 @@ from clustering.clusterer import StoryCluster
 
 logger = logging.getLogger(__name__)
 
+# Suppress httpx's own debug logging to prevent Authorization headers from
+# appearing in log output if the root log level is ever set to DEBUG.
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+
 _PPLX_API_URL = "https://api.perplexity.ai/chat/completions"
-_PPLX_MODEL = "sonar"  # sonar-reasoning was deprecated; sonar is the current standard model
+_PPLX_MODEL = "sonar"
 _LLAMA_DEFAULT_BASE_URL = "http://localhost:8080"
 _DEFAULT_MAX_CALLS = 50
-_SUMMARY_PREVIEW_CHARS = 300  # Max chars per article summary in prompt — controls input token cost
-
-
-def _mask_auth_header(request: httpx.Request) -> None:
-    """httpx request hook: redact Authorization header value in any log output.
-
-    httpx can log full request details at DEBUG level, which would expose
-    the Bearer token. This hook replaces the value with a fixed placeholder
-    so the key never appears in logs regardless of the log level in use.
-    """
-    if "authorization" in request.headers:
-        # headers are case-insensitive but the assignment must use the exact
-        # key format that httpx stores internally.
-        request.headers["authorization"] = "Bearer [REDACTED]"
+_SUMMARY_PREVIEW_CHARS = 300
 
 
 @dataclass
 class LLMAnalysisResult:
     cluster_id: int
-    extracted_facts: list[str]        # Verifiable factual claims found across all sources
-    framing_notes: list[str]          # Plain-language descriptions of framing differences
-    bias_notes: str                   # Short paragraph for digest — what was stripped and why
-    provider_used: str                # "perplexity" | "local" | "none"
-    skipped: bool = False             # True if max_llm_calls cap was hit
+    extracted_facts: list[str]
+    framing_notes: list[str]
+    bias_notes: str
+    provider_used: str
+    skipped: bool = False
 
 
 class LLMAnalyzer:
@@ -93,17 +87,10 @@ class LLMAnalyzer:
         self._pplx_key = os.getenv("PPLX_API_KEY", "")
         self._llama_model = os.getenv("LLAMA_CPP_MODEL", "llama3")
 
-        # Normalize the base URL: strip trailing slash and any /v1 suffix
-        # so we can always safely append /v1/chat/completions ourselves.
         raw_base = os.getenv("LLAMA_CPP_BASE_URL", _LLAMA_DEFAULT_BASE_URL)
         self._llama_base_url = re.sub(r"(/v1)?/?$", "", raw_base.rstrip("/"))
 
-        # event_hooks ensure the Authorization header is redacted before httpx
-        # can include it in any debug-level log output.
-        self._client = httpx.Client(
-            timeout=60.0,
-            event_hooks={"request": [_mask_auth_header]},
-        )
+        self._client = httpx.Client(timeout=60.0)
 
     def analyze(
         self,
@@ -155,12 +142,9 @@ class LLMAnalyzer:
         """Build the analysis prompt.
 
         Source names and bias-lean labels are intentionally excluded.
-        Providing them primes the LLM to reason about a source's political
-        identity rather than the actual content. Articles are labelled
-        ARTICLE_1, ARTICLE_2, etc. only.
-
-        Article summaries are truncated to _SUMMARY_PREVIEW_CHARS to keep
-        input token usage predictable. Headlines are never truncated.
+        Articles are labelled ARTICLE_1, ARTICLE_2, etc. only.
+        Summaries are truncated to _SUMMARY_PREVIEW_CHARS to keep input
+        token usage predictable.
         """
         articles_text = "\n\n".join(
             f"ARTICLE_{idx + 1}\n"
