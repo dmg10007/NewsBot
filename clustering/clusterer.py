@@ -9,6 +9,13 @@ Approach:
   2. Use util.semantic_search() for batched ANN similarity (O(n) vs O(n²))
   3. Greedily assign articles to clusters using a similarity threshold
   4. Attach corroboration metadata (how many sources, which tiers, bias spread)
+
+Model loading
+-------------
+StoryClusterer no longer loads its own SentenceTransformer instance.
+It delegates to utils.model_registry.get_model(), which returns a shared
+cached instance. This eliminates the double load that occurred when both
+Deduplicator and StoryClusterer were instantiated in the same run.
 """
 
 from __future__ import annotations
@@ -19,10 +26,11 @@ from datetime import datetime
 from typing import Optional
 
 import numpy as np
-from sentence_transformers import SentenceTransformer, util
+from sentence_transformers import util
 
 from config.loader import get_settings
 from parsing.extractor import ParsedArticle
+from utils.model_registry import get_model
 
 logger = logging.getLogger(__name__)
 
@@ -82,7 +90,6 @@ class StoryClusterer:
     def __init__(self) -> None:
         self.settings = get_settings()
         self._threshold: float = self.settings["clustering"]["similarity_threshold"]
-        self._model: SentenceTransformer | None = None
 
     def cluster(self, articles: list[ParsedArticle]) -> list[StoryCluster]:
         if not articles:
@@ -92,7 +99,7 @@ class StoryClusterer:
         if len(articles) == 1:
             return [self._make_cluster(0, articles)]
 
-        model = self._get_model()
+        model = get_model(self.settings["clustering"]["model"])
         texts = [a.full_text for a in articles]
         logger.info("Encoding %d articles for clustering...", len(texts))
         embeddings = model.encode(texts, convert_to_tensor=True, show_progress_bar=False)
@@ -157,10 +164,3 @@ class StoryClusterer:
         if region == "north_carolina":
             return "state"
         return "local"
-
-    def _get_model(self) -> SentenceTransformer:
-        if self._model is None:
-            model_name = self.settings["clustering"]["model"]
-            logger.info("Loading sentence-transformer model: %s", model_name)
-            self._model = SentenceTransformer(model_name)
-        return self._model

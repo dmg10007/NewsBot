@@ -8,6 +8,26 @@ every run, cache_ttl_seconds in settings.yaml has no effect across runs.
 The cache is useful only if fetch_all() is called multiple times on the
 same instance within a single run (e.g. during testing). A persistent
 cross-run cache (file-based shelve or Redis) is a future improvement.
+
+Timeout note
+------------
+feedparser.parse(url) uses urllib internally with no socket timeout and
+will hang indefinitely on a slow or unresponsive host. All RSS content is
+now pre-fetched via httpx (which respects the configured timeout) and the
+raw text is passed to feedparser.parse() instead of a URL.
+
+Rate limiting
+-------------
+A configurable inter-request delay (request_delay_seconds in settings.yaml)
+is applied between source fetches to avoid hammering servers and reducing
+the risk of IP blocks. Always verify that your usage complies with each
+source's robots.txt and Terms of Service.
+
+URL hash
+--------
+URL hashes use the full 64-char SHA-256 hex digest (256 bits). The previous
+16-char truncation created a non-trivial birthday collision probability at
+scale and is unsafe for deduplication.
 """
 
 from __future__ import annotations
@@ -20,7 +40,7 @@ from datetime import datetime, timezone
 from typing import Optional
 
 import feedparser
-import yaml
+import httpx
 
 from config.loader import get_settings
 
@@ -55,15 +75,17 @@ class RawArticle:
     url_hash: str = field(init=False)
 
     def __post_init__(self) -> None:
-        self.url_hash = hashlib.sha256(self.url.encode()).hexdigest()[:16]
+        # Full 256-bit SHA-256 digest. The previous 16-char truncation (64 bits)
+        # created a non-trivial birthday collision risk at scale.
+        self.url_hash = hashlib.sha256(self.url.encode()).hexdigest()
 
 
 class FeedFetcher:
     """Fetches and parses RSS feeds defined in sources.yaml.
 
-    feedparser manages its own HTTP internally, so FeedFetcher does not
-    maintain an httpx client. The optional bias_resolver argument is the
-    only component that makes outbound HTTP calls.
+    Uses httpx for all outbound HTTP so that timeouts are enforced uniformly.
+    feedparser.parse() is called with the raw response text, never a URL,
+    to avoid urllib's lack of a socket timeout.
     """
 
     def __init__(self, bias_resolver=None) -> None:
@@ -77,15 +99,28 @@ class FeedFetcher:
         self.settings = get_settings()
         self._cache: dict[str, tuple[float, list[RawArticle]]] = {}
         self._bias_resolver = bias_resolver
+        timeout = self.settings["ingestion"]["request_timeout_seconds"]
+        user_agent = self.settings["ingestion"]["user_agent"]
+        self._client = httpx.Client(
+            timeout=timeout,
+            headers={"User-Agent": user_agent},
+            follow_redirects=True,
+        )
+        self._request_delay: float = self.settings["ingestion"].get(
+            "request_delay_seconds", 1.0
+        )
 
     def fetch_all(self, sources: list[dict]) -> list[RawArticle]:
         """Fetch all RSS sources, return flat list of RawArticles."""
         articles: list[RawArticle] = []
-        for source in sources:
+        for i, source in enumerate(sources):
             try:
                 articles.extend(self._fetch_source(source))
             except Exception as exc:
                 logger.error("Failed to fetch %s: %s", source["name"], exc)
+            # Apply inter-request delay after every source except the last
+            if i < len(sources) - 1 and self._request_delay > 0:
+                time.sleep(self._request_delay)
         return articles
 
     def _fetch_source(self, source: dict) -> list[RawArticle]:
@@ -110,7 +145,11 @@ class FeedFetcher:
 
         for attempt in range(1, max_retries + 1):
             try:
-                feed = feedparser.parse(source["url"])
+                # Pre-fetch via httpx so the configured timeout is enforced.
+                # feedparser.parse(url) uses urllib with no socket timeout.
+                response = self._client.get(source["url"])
+                response.raise_for_status()
+                feed = feedparser.parse(response.text)
                 articles = []
                 for entry in feed.entries[:max_per_source]:
                     article = self._entry_to_article(entry, source)
@@ -120,18 +159,25 @@ class FeedFetcher:
                     "Fetched %d articles from %s", len(articles), source["name"]
                 )
                 return articles
+            except httpx.TimeoutException:
+                logger.warning(
+                    "Timeout on attempt %d/%d for %s",
+                    attempt, max_retries, source["name"],
+                )
             except Exception as exc:
                 logger.warning(
                     "Attempt %d/%d failed for %s: %s",
                     attempt, max_retries, source["name"], exc
                 )
-                if attempt < max_retries:
-                    time.sleep(backoff * attempt)
+            if attempt < max_retries:
+                time.sleep(backoff * attempt)
 
         logger.error("All retries exhausted for %s", source["name"])
         return []
 
-    def _entry_to_article(self, entry: feedparser.FeedParserDict, source: dict) -> Optional[RawArticle]:
+    def _entry_to_article(
+        self, entry: feedparser.FeedParserDict, source: dict
+    ) -> Optional[RawArticle]:
         url = getattr(entry, "link", "").strip()
         headline = getattr(entry, "title", "").strip()
         if not url or not headline:
@@ -142,7 +188,6 @@ class FeedFetcher:
         if hasattr(entry, "published_parsed") and entry.published_parsed:
             published_at = datetime(*entry.published_parsed[:6], tzinfo=timezone.utc)
 
-        # Resolve bias metadata from AllSides + MBFC if resolver is available
         bias_metadata: Optional[BiasMetadata] = None
         if self._bias_resolver is not None:
             try:
@@ -178,5 +223,5 @@ class FeedFetcher:
         )
 
     def close(self) -> None:
-        """No-op. Kept for API compatibility — feedparser manages its own connections."""
-        pass
+        """Close the underlying httpx client."""
+        self._client.close()

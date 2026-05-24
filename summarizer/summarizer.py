@@ -1,17 +1,32 @@
-"""Neutral digest summarization using local llama.cpp.
+"""Article summarizer: fetches full article text and produces bias-free summaries.
 
-Takes a StoryCluster + LLMAnalysisResult and produces a short,
-bias-stripped paragraph suitable for the email digest.
+Pipeline per cluster:
+  1. Attempt to fetch full article text via ArticleFetcher (httpx + trafilatura)
+  2. Fall back to RSS summary if fetch fails or yields < MIN_CONTENT_CHARS
+  3. Optionally enrich with Brave Search context for high-importance clusters
+  4. Call Perplexity Sonar (or extractive fallback) to produce a neutral summary
+  5. Return a SummarizedCluster ready for digest rendering
 
-Summary quality hierarchy (best to worst):
-  1. LLM summary from cross-source extracted facts  (multi-source clusters)
-  2. RSS description text (cleaned, echo-checked)   (any cluster)
-  3. Full article body scraped from the source URL  (fallback enrichment)
-  4. Brave Search snippets for the headline         (fallback enrichment)
-  5. Entity-based sentence                          (last resort)
-  6. Bare "full details via link" message           (absolute last resort)
+Connection management
+---------------------
+Summarizer owns three httpx.Client instances (via ArticleFetcher and
+BraveSearchClient). Always call summarizer.close() when done, or use it
+as a context manager:
 
-Levels 3-4 only fire when BRAVE_SEARCH_API_KEY is set and levels 1-2 fail.
+    with Summarizer() as s:
+        results = s.summarize_all(clusters)
+
+Failure modes
+-------------
+The summarizer degrades gracefully:
+  - Full text fetch fails  -> uses RSS summary
+  - Brave enrichment fails -> skips enrichment, continues with available text
+  - LLM call fails         -> returns extractive fallback (first 3 sentences)
+A SummarizedCluster is always returned; nothing is silently dropped.
+
+Token budget
+------------
+Input text is truncated to MAX_INPUT_CHARS (4000) before the LLM call.
 """
 
 from __future__ import annotations
@@ -19,273 +34,239 @@ from __future__ import annotations
 import logging
 import os
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional
 
 import httpx
 
-from bias.llm_analyzer import LLMAnalysisResult
 from clustering.clusterer import StoryCluster
 from config.loader import get_settings
-from ingestion.article_fetcher import ArticleFetcher
-from ingestion.brave_search import BraveSearch
 
 logger = logging.getLogger(__name__)
 
-_LLAMA_DEFAULT_URL = "http://localhost:8080"
-
-# Minimum word count for an RSS summary to be considered useful.
-_MIN_SUMMARY_WORDS = 8
-
-# If this fraction of the summary's words are also in the headline, treat
-# it as a headline echo and discard it.
-_HEADLINE_OVERLAP_THRESHOLD = 0.6
-
-SYSTEM_PROMPT = """You are a neutral news summarizer. Your output will appear in a bias-free daily briefing.
-Rules:
-- Write 2-4 sentences maximum
-- Use only the facts provided — do not add context or inference
-- Use neutral, plain language
-- Do not name a political winner or loser
-- Do not use loaded, emotional, or charged words
-- Write in third-person past tense
-- Do not repeat the source names in the summary"""
+MIN_CONTENT_CHARS = 200
+MAX_INPUT_CHARS = 4000
+_PPLX_API_URL = "https://api.perplexity.ai/chat/completions"
+_PPLX_MODEL = "sonar"
 
 
 @dataclass
-class SourceLink:
-    """A single article link with its source label and bias lean."""
-    source_name: str
-    url: str
-    bias_lean: Optional[str] = None
-
-
-@dataclass
-class SummaryResult:
+class SummarizedCluster:
+    """A story cluster with a bias-free summary ready for digest rendering."""
     cluster_id: int
+    headline: str
     summary: str
-    source_count: int
-    tiers_covered: list[str]
-    is_single_source: bool
-    topic: str
-    representative_headline: str
+    sources: list[str]
     bias_notes: str
-    provider_used: str
-    sources: list[SourceLink] = field(default_factory=list)
+    importance_score: float
+    tiers: list[str]
+    source_count: int
+    has_cross_lean_coverage: bool
+    fallback_used: bool = False
+
+
+class ArticleFetcher:
+    """Fetches and extracts full article text from URLs using trafilatura."""
+
+    def __init__(self, timeout: float = 15.0, user_agent: str = "NewsBot/1.0") -> None:
+        self._client = httpx.Client(
+            timeout=timeout,
+            headers={"User-Agent": user_agent},
+            follow_redirects=True,
+        )
+
+    def fetch(self, url: str) -> Optional[str]:
+        """Return extracted article text, or None on failure."""
+        try:
+            import trafilatura
+            response = self._client.get(url)
+            response.raise_for_status()
+            text = trafilatura.extract(response.text)
+            if text and len(text) >= MIN_CONTENT_CHARS:
+                return text
+        except Exception as exc:
+            logger.debug("ArticleFetcher failed for %s: %s", url, exc)
+        return None
+
+    def close(self) -> None:
+        self._client.close()
+
+
+class BraveSearchClient:
+    """Fetches additional context for high-importance clusters via Brave Search API."""
+
+    def __init__(self) -> None:
+        self._api_key = os.getenv("BRAVE_SEARCH_API_KEY", "")
+        self._client = httpx.Client(timeout=10.0)
+
+    def search(self, query: str, count: int = 3) -> list[str]:
+        """Return a list of snippet strings for the query, or [] on failure."""
+        if not self._api_key:
+            return []
+        try:
+            response = self._client.get(
+                "https://api.search.brave.com/res/v1/web/search",
+                params={"q": query, "count": count},
+                headers={
+                    "Accept": "application/json",
+                    "X-Subscription-Token": self._api_key,
+                },
+            )
+            response.raise_for_status()
+            results = response.json().get("web", {}).get("results", [])
+            return [r.get("description", "") for r in results if r.get("description")]
+        except Exception as exc:
+            logger.debug("Brave search failed for query '%s': %s", query, exc)
+            return []
+
+    def close(self) -> None:
+        self._client.close()
 
 
 class Summarizer:
+    """Produces neutral summaries for each StoryCluster.
+
+    Lifecycle: call close() (or use as a context manager) when done to release
+    the underlying httpx connection pools.
+    """
+
     def __init__(self) -> None:
         self.settings = get_settings()
-        self._llama_url = os.getenv("LLAMA_CPP_BASE_URL", _LLAMA_DEFAULT_URL)
-        self._llama_model = os.getenv("LLAMA_CPP_MODEL", "llama3")
-        self._max_tokens = self.settings["summarization"]["max_summary_tokens"]
-        self._client = httpx.Client(timeout=60.0)
-        self._article_fetcher = ArticleFetcher()
-        self._brave = BraveSearch()
-        if self._brave.available:
-            logger.info("Brave Search enrichment enabled.")
+        self._pplx_key = os.getenv("PPLX_API_KEY", "")
+        timeout = self.settings["summarizer"]["request_timeout_seconds"]
+        user_agent = self.settings["ingestion"]["user_agent"]
+        self._client = httpx.Client(timeout=timeout)
+        self._article_fetcher = ArticleFetcher(
+            timeout=self.settings["summarizer"]["article_fetch_timeout_seconds"],
+            user_agent=user_agent,
+        )
+        self._brave = BraveSearchClient()
+
+    def __enter__(self) -> "Summarizer":
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        self.close()
+
+    def close(self) -> None:
+        """Release all underlying httpx connection pools.
+
+        Must be called when the Summarizer is no longer needed, unless the
+        instance is used as a context manager (which calls this automatically).
+        The scheduler should use:
+
+            with Summarizer() as s:
+                results = s.summarize_all(clusters)
+
+        Or with explicit try/finally:
+
+            summarizer = Summarizer()
+            try:
+                results = summarizer.summarize_all(clusters)
+            finally:
+                summarizer.close()
+        """
+        self._client.close()
+        self._article_fetcher.close()
+        self._brave.close()
+
+    def summarize_all(self, clusters: list[StoryCluster]) -> list[SummarizedCluster]:
+        """Summarize every cluster. Returns results in input order."""
+        results = []
+        for cluster in clusters:
+            try:
+                results.append(self._summarize_cluster(cluster))
+            except Exception as exc:
+                logger.error("Summarization failed for cluster %d: %s", cluster.cluster_id, exc)
+                results.append(self._fallback_summary(cluster))
+        return results
+
+    def _summarize_cluster(self, cluster: StoryCluster) -> SummarizedCluster:
+        input_text = self._build_input_text(cluster)
+
+        if cluster.importance_score >= self.settings["summarizer"].get("brave_enrich_threshold", 0.7):
+            snippets = self._brave.search(cluster.representative_headline, count=3)
+            if snippets:
+                input_text += "\n\nADDITIONAL CONTEXT:\n" + "\n".join(snippets)
+
+        input_text = input_text[:MAX_INPUT_CHARS]
+
+        if self._pplx_key:
+            try:
+                summary = self._call_perplexity(input_text)
+                fallback = False
+            except Exception as exc:
+                logger.warning("LLM summarization failed for cluster %d: %s", cluster.cluster_id, exc)
+                summary = self._extractive_fallback(input_text)
+                fallback = True
         else:
-            logger.info(
-                "Brave Search enrichment disabled (BRAVE_SEARCH_API_KEY not set)."
-            )
+            summary = self._extractive_fallback(input_text)
+            fallback = True
 
-    def summarize(self, cluster: StoryCluster, analysis: LLMAnalysisResult) -> SummaryResult:
-        facts = analysis.extracted_facts
-        bias_notes = analysis.bias_notes
-
-        # Build per-source links, one per unique source.
-        seen_sources: set[str] = set()
-        source_links: list[SourceLink] = []
-        for article in cluster.articles:
-            name = article.raw.source_name
-            url = article.raw.url
-            if name not in seen_sources and url:
-                seen_sources.add(name)
-                source_links.append(SourceLink(
-                    source_name=name,
-                    url=url,
-                    bias_lean=getattr(article.raw, "bias_lean", None),
-                ))
-        source_links.sort(key=lambda s: s.source_name.lower())
-
-        if cluster.source_count > 1 and facts:
-            summary = self._summarize_from_facts(facts, cluster)
-            provider = "local"
-        else:
-            summary = self._fallback_summary(cluster)
-            provider = "fallback"
-
-        return SummaryResult(
+        return SummarizedCluster(
             cluster_id=cluster.cluster_id,
+            headline=cluster.representative_headline,
             summary=summary,
+            sources=list({a.raw.source_name for a in cluster.articles}),
+            bias_notes="",
+            importance_score=cluster.importance_score,
+            tiers=cluster.tiers,
             source_count=cluster.source_count,
-            tiers_covered=cluster.tiers,
-            is_single_source=cluster.source_count == 1,
-            topic=cluster.topic,
-            representative_headline=cluster.representative_headline,
-            bias_notes=bias_notes,
-            provider_used=provider,
-            sources=source_links,
+            has_cross_lean_coverage=cluster.has_cross_lean_coverage,
+            fallback_used=fallback,
         )
 
-    # ------------------------------------------------------------------
-    # LLM path
-    # ------------------------------------------------------------------
+    def _build_input_text(self, cluster: StoryCluster) -> str:
+        parts = []
+        for article in cluster.articles:
+            full_text = self._article_fetcher.fetch(article.raw.url)
+            text = full_text if full_text else article.raw.summary
+            parts.append(f"SOURCE: {article.raw.source_name}\n{text}")
+        return "\n\n---\n\n".join(parts)
 
-    def _summarize_from_facts(self, facts: list[str], cluster: StoryCluster) -> str:
-        facts_text = "\n".join(f"- {f}" for f in facts[:10])
-        user_prompt = (
-            f"Summarize the following verified facts from a news story into 2-4 neutral sentences:\n\n"
-            f"{facts_text}\n\n"
-            f"Story headline for context (do not copy verbatim): {cluster.representative_headline}"
-        )
-        try:
-            return self._call_local(user_prompt)
-        except Exception as exc:
-            logger.warning("Local LLM summarization failed: %s. Using fallback.", exc)
-            return self._fallback_summary(cluster)
-
-    def _call_local(self, user_prompt: str) -> str:
+    def _call_perplexity(self, input_text: str) -> str:
         payload = {
-            "model": self._llama_model,
+            "model": _PPLX_MODEL,
             "messages": [
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": user_prompt},
+                {
+                    "role": "system",
+                    "content": (
+                        "You are a neutral news summarizer. Produce a concise 3-5 sentence "
+                        "summary containing only verifiable facts. Remove editorial framing, "
+                        "emotional language, and opinion. Use plain, direct language."
+                    ),
+                },
+                {"role": "user", "content": input_text},
             ],
-            "max_tokens": self._max_tokens,
+            "max_tokens": 300,
             "temperature": 0.1,
         }
         response = self._client.post(
-            f"{self._llama_url.rstrip('/')}/v1/chat/completions",
+            _PPLX_API_URL,
             json=payload,
+            headers={
+                "Authorization": f"Bearer {self._pplx_key}",
+                "Content-Type": "application/json",
+            },
         )
         response.raise_for_status()
         return response.json()["choices"][0]["message"]["content"].strip()
 
-    # ------------------------------------------------------------------
-    # Fallback path: RSS → article body → Brave snippets → entities
-    # ------------------------------------------------------------------
+    def _extractive_fallback(self, text: str) -> str:
+        sentences = re.split(r'(?<=[.!?])\s+', text.strip())
+        return " ".join(sentences[:3])
 
-    def _fallback_summary(self, cluster: StoryCluster) -> str:
-        """Multi-tier fallback when the LLM path is unavailable or skipped.
-
-        Tier 1: RSS description (cleaned + echo-checked)
-        Tier 2: Full article body scraped from the source URL
-        Tier 3: Brave Search snippets for the headline
-        Tier 4: Entity-based sentence
-        Tier 5: Bare fallback message
-        """
+    def _fallback_summary(self, cluster: StoryCluster) -> SummarizedCluster:
         headline = cluster.representative_headline
-
-        # --- Tier 1: RSS description ---
-        credibility_order = {"high": 0, "medium": 1, "low": 2}
-        sorted_articles = sorted(
-            cluster.articles,
-            key=lambda a: credibility_order.get(a.raw.credibility, 2),
+        return SummarizedCluster(
+            cluster_id=cluster.cluster_id,
+            headline=headline,
+            summary=headline,
+            sources=list({a.raw.source_name for a in cluster.articles}),
+            bias_notes="",
+            importance_score=cluster.importance_score,
+            tiers=cluster.tiers,
+            source_count=cluster.source_count,
+            has_cross_lean_coverage=cluster.has_cross_lean_coverage,
+            fallback_used=True,
         )
-        for article in sorted_articles:
-            raw = article.raw.summary.strip()
-            if not raw:
-                continue
-            cleaned = self._clean_rss_summary(raw)
-            if cleaned and not self._is_headline_echo(cleaned, headline):
-                return cleaned
-
-        # --- Tier 2: Full article body scrape ---
-        for article in sorted_articles:
-            url = article.raw.url
-            if not url:
-                continue
-            body = self._article_fetcher.fetch_body(url)
-            if not body:
-                continue
-            summary = self._extract_summary_from_body(body, headline)
-            if summary:
-                logger.debug("Used article body for summary: %s", headline[:60])
-                return summary
-
-        # --- Tier 3: Brave Search snippets ---
-        if self._brave.available:
-            snippets = self._brave.search_snippets(headline)
-            if snippets:
-                summary = self._extract_summary_from_body(snippets, headline)
-                if summary:
-                    logger.debug("Used Brave snippets for summary: %s", headline[:60])
-                    return summary
-
-        # --- Tier 4: Entity-based sentence ---
-        entities = list({
-            e[0] for a in cluster.articles for e in a.entities
-            if e[1] in ("PERSON", "ORG", "GPE", "LOC")
-        })[:5]
-        if entities:
-            return (
-                f"Key subjects: {', '.join(entities)}. "
-                f"Full details available via the source link(s) below."
-            )
-
-        # --- Tier 5: Bare fallback ---
-        return "Full details available via the source link(s) below."
-
-    def _extract_summary_from_body(self, text: str, headline: str) -> str:
-        """Extract a clean 1-2 sentence summary from a body of text.
-
-        Splits into sentences, discards ones that are headline echoes or too
-        short, and returns the first 1-2 that pass. This avoids feeding the
-        entire body to the LLM when we just need a brief summary snippet.
-        """
-        # Collapse whitespace
-        text = re.sub(r"\s+", " ", text).strip()
-        if not text:
-            return ""
-
-        sentences = re.split(r"(?<=[.!?])\s+", text)
-        good: list[str] = []
-        for sent in sentences:
-            sent = sent.strip()
-            if len(sent.split()) < _MIN_SUMMARY_WORDS:
-                continue
-            if self._is_headline_echo(sent, headline):
-                continue
-            good.append(sent)
-            if len(good) == 2:
-                break
-
-        return " ".join(good).strip()
-
-    # ------------------------------------------------------------------
-    # Shared text-cleaning utilities
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def _clean_rss_summary(text: str) -> str:
-        """Strip HTML, remove source-name suffixes, collapse whitespace, cap at 2 sentences."""
-        text = re.sub(r"<[^>]+>", " ", text)
-        text = re.sub(r"\s{3,}[A-Z][^\n]{1,40}$", "", text).strip()
-        text = re.sub(r"\s+", " ", text).strip()
-        if not text:
-            return ""
-        sentences = re.split(r"(?<=[.!?])\s+", text)
-        result = " ".join(sentences[:2]).strip()
-        if len(result.split()) < _MIN_SUMMARY_WORDS:
-            return ""
-        return result
-
-    @staticmethod
-    def _is_headline_echo(summary: str, headline: str) -> bool:
-        """Return True if summary is a near-duplicate of the headline."""
-        def meaningful_words(s: str) -> set[str]:
-            return {w.lower() for w in re.findall(r"[a-zA-Z]{4,}", s)}
-
-        summary_words = meaningful_words(summary)
-        if not summary_words:
-            return True
-        headline_words = meaningful_words(headline)
-        overlap = summary_words & headline_words
-        return len(overlap) / len(summary_words) >= _HEADLINE_OVERLAP_THRESHOLD
-
-    def close(self) -> None:
-        self._client.close()
-        self._article_fetcher.close()
-        self._brave.close()
