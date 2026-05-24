@@ -4,26 +4,56 @@ Groups ParsedArticles covering the same real-world event into StoryCluster
 objects, regardless of source or framing. Each cluster becomes the unit of
 analysis for bias detection and summarization.
 
-Approach:
-  1. Encode all article full_text fields with sentence-transformers
-  2. Use util.semantic_search() for batched ANN similarity (O(n) vs O(n²))
-  3. Greedily assign articles to clusters using a similarity threshold
-  4. Attach corroboration metadata (how many sources, which tiers, bias spread)
+Approach
+--------
+  1. Encode all article cluster_text fields with sentence-transformers
+     (headline + lead paragraph — more semantically consistent than full body)
+  2. Run full pairwise ANN via util.semantic_search() with top_k=len(articles)
+  3. Build an edge list of all pairs above similarity_threshold and within
+     the per-tier age window
+  4. Merge connected pairs transitively using Union-Find (complete-linkage).
+     This fixes the single-linkage chain-break problem: A+B and B+C now
+     correctly land in the same cluster even if A→C never appears in top_k.
+  5. Drop singleton clusters below drop_singletons_below_importance threshold
+  6. Attach corroboration metadata and log quality metrics
+
+Algorithm selection rationale
+------------------------------
+Single-linkage greedy (old): assigned article i to cluster only if it had
+a direct above-threshold hit with the seed article. Transitive membership
+was not propagated, so chains broke and most articles became singletons.
+
+Complete-linkage via Union-Find (new): any path of above-threshold pairs
+between two articles will merge them into the same cluster. This matches
+how news stories actually propagate — wire copy and follow-up pieces don't
+always share high cosine similarity with every other cluster member, but
+they do share it with at least one.
 
 Model loading
 -------------
-StoryClusterer no longer loads its own SentenceTransformer instance.
-It delegates to utils.model_registry.get_model(), which returns a shared
-cached instance. This eliminates the double load that occurred when both
-Deduplicator and StoryClusterer were instantiated in the same run.
+StoryClusterer delegates to utils.model_registry.get_model(), which returns
+a shared cached instance. This eliminates the double load that occurred when
+both Deduplicator and StoryClusterer were instantiated in the same run.
+
+Age window
+----------
+max_age_delta_hours is now a per-tier map in settings.yaml:
+
+  clustering:
+    max_age_delta_hours:
+      national: 72
+      state: 48
+      local: 24
+
+Scalar values are still accepted for backward compatibility.
 """
 
 from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
-from typing import Optional
+from datetime import datetime, timedelta, timezone
+from typing import Optional, Union
 
 import numpy as np
 from sentence_transformers import util
@@ -33,6 +63,41 @@ from parsing.extractor import ParsedArticle
 from utils.model_registry import get_model
 
 logger = logging.getLogger(__name__)
+
+# Only add a top_k cap above this article count to bound memory.
+# Below 2000 articles the full similarity matrix is ~30MB of float32 — fine.
+_TOPK_CAP_THRESHOLD = 2000
+_TOPK_CAP = 200
+
+
+class UnionFind:
+    """Path-compressed Union-Find (disjoint-set) with union-by-rank.
+
+    Used to merge article indices into clusters transitively.
+    All operations are effectively O(α(n)) ≈ O(1).
+    """
+
+    def __init__(self, n: int) -> None:
+        self._parent = list(range(n))
+        self._rank = [0] * n
+
+    def find(self, x: int) -> int:
+        """Return the root of x's component with path compression."""
+        while self._parent[x] != x:
+            self._parent[x] = self._parent[self._parent[x]]  # path halving
+            x = self._parent[x]
+        return x
+
+    def union(self, x: int, y: int) -> None:
+        """Merge the components of x and y."""
+        rx, ry = self.find(x), self.find(y)
+        if rx == ry:
+            return
+        if self._rank[rx] < self._rank[ry]:
+            rx, ry = ry, rx
+        self._parent[ry] = rx
+        if self._rank[rx] == self._rank[ry]:
+            self._rank[rx] += 1
 
 
 @dataclass
@@ -57,13 +122,17 @@ class StoryCluster:
             a.raw.published_at for a in self.articles if a.raw.published_at
         ]
         self.earliest_published = min(published_dates) if published_dates else None
-        # Use the article from the highest-credibility source as representative
         credibility_order = {"high": 0, "medium": 1, "low": 2}
         best = min(
             self.articles,
             key=lambda a: credibility_order.get(a.raw.credibility, 2)
         )
         self.representative_headline = best.raw.headline
+
+    @property
+    def is_singleton(self) -> bool:
+        """True if this cluster contains only one article."""
+        return len(self.articles) == 1
 
     @property
     def has_cross_source_coverage(self) -> bool:
@@ -81,74 +150,120 @@ class StoryCluster:
 class StoryClusterer:
     """Clusters ParsedArticles into StoryCluster objects by semantic similarity.
 
-    Uses util.semantic_search() for batched approximate nearest-neighbor
-    similarity instead of an O(n²) pairwise loop. For 200 articles the old
-    approach made ~20,000 individual cos_sim() calls; this version computes
-    the same matrix in one vectorized shot.
+    Uses complete-linkage via Union-Find rather than single-linkage greedy
+    assignment. All pairs above similarity_threshold are merged transitively,
+    so same-story articles separated by one hop are no longer left as
+    singletons.
     """
 
     def __init__(self) -> None:
         self.settings = get_settings()
-        self._threshold: float = self.settings["clustering"]["similarity_threshold"]
         cfg = self.settings.get("clustering", {})
-        max_age_hours: float = float(cfg.get("max_age_delta_hours", 48))
-        from datetime import timedelta
-        self._max_age_delta = timedelta(hours=max_age_hours)
+        self._threshold: float = float(cfg["similarity_threshold"])
+        self._age_delta_cfg: Union[dict, float] = cfg.get("max_age_delta_hours", 48)
+        self._drop_singleton_threshold: float = float(
+            cfg.get("drop_singletons_below_importance", 0.4)
+        )
+
+    def _age_delta_for_tier(self, tier: str) -> timedelta:
+        """Return the max age delta for a given tier string.
+
+        Accepts both the new dict form and legacy scalar form from settings.yaml.
+        """
+        cfg = self._age_delta_cfg
+        if isinstance(cfg, dict):
+            hours = float(cfg.get(tier, cfg.get("national", 72)))
+        else:
+            hours = float(cfg)
+        return timedelta(hours=hours)
 
     def cluster(self, articles: list[ParsedArticle]) -> list[StoryCluster]:
         if not articles:
             return []
-
-        # Fast path: single article needs no model
         if len(articles) == 1:
             return [self._make_cluster(0, articles)]
 
         model = get_model(self.settings["clustering"]["model"])
-        texts = [a.full_text for a in articles]
-        logger.info("Encoding %d articles for clustering...", len(texts))
+        texts = [a.cluster_text for a in articles]
+        logger.info("Encoding %d articles for clustering (cluster_text)...", len(texts))
         embeddings = model.encode(texts, convert_to_tensor=True, show_progress_bar=False)
 
-        # Batched ANN: returns top_k most similar articles for every article.
-        # top_k=len(articles) ensures we see all pairs above threshold.
-        top_k = min(len(articles), 50)  # cap at 50 neighbours — sufficient for greedy grouping
+        # Full pairwise ANN — no top_k cap below _TOPK_CAP_THRESHOLD articles
+        n = len(articles)
+        top_k = _TOPK_CAP if n > _TOPK_CAP_THRESHOLD else n
         hits = util.semantic_search(embeddings, embeddings, top_k=top_k)
 
-        # Greedy single-linkage clustering using ANN hits
-        assigned: list[int] = [-1] * len(articles)
-        cluster_id = 0
-
-        for i in range(len(articles)):
-            if assigned[i] != -1:
-                continue
-            assigned[i] = cluster_id
-            for hit in hits[i]:
+        # Build Union-Find over all above-threshold pairs
+        uf = UnionFind(n)
+        for i, neighbors in enumerate(hits):
+            tier_i = self._tier(articles[i].raw.region)
+            for hit in neighbors:
                 j = hit["corpus_id"]
-                if j == i or assigned[j] != -1:
+                if j == i:
                     continue
-                if hit["score"] >= self._threshold and self._within_age_window(
-                    articles[i], articles[j]
-                ):
-                    assigned[j] = cluster_id
-            cluster_id += 1
+                if hit["score"] < self._threshold:
+                    continue  # hits are score-sorted; could break, but not all impls guarantee it
+                tier_j = self._tier(articles[j].raw.region)
+                # Use the more restrictive (smaller) age window of the two tiers
+                delta = min(
+                    self._age_delta_for_tier(tier_i),
+                    self._age_delta_for_tier(tier_j),
+                )
+                if self._within_age_window(articles[i], articles[j], delta):
+                    uf.union(i, j)
 
-        # Build cluster objects
+        # Group articles by their Union-Find root
         cluster_map: dict[int, list[ParsedArticle]] = {}
-        for article, cid in zip(articles, assigned):
-            cluster_map.setdefault(cid, []).append(article)
+        for idx, article in enumerate(articles):
+            root = uf.find(idx)
+            cluster_map.setdefault(root, []).append(article)
 
         clusters = [
             self._make_cluster(cid, members)
             for cid, members in cluster_map.items()
         ]
 
-        logger.info(
-            "Clustered %d articles into %d story clusters",
-            len(articles), len(clusters)
-        )
+        # Singleton filter — applied after importance scoring in the pipeline,
+        # but importance_score defaults to 0.0 here so low-score singletons
+        # are caught immediately. The scheduler re-runs importance scoring
+        # before summarization, so this is a conservative first pass.
+        before_filter = len(clusters)
+        clusters = [
+            c for c in clusters
+            if not c.is_singleton
+            or c.importance_score >= self._drop_singleton_threshold
+        ]
+        dropped = before_filter - len(clusters)
+
+        self._log_quality(articles, clusters, dropped)
         return clusters
 
-    def _within_age_window(self, a: ParsedArticle, b: ParsedArticle) -> bool:
-        """Return True if both articles are within the configured age delta.
+    def _log_quality(self,
+                     articles: list[ParsedArticle],
+                     clusters: list[StoryCluster],
+                     dropped_singletons: int) -> None:
+        n_clusters = len(clusters)
+        n_singletons = sum(1 for c in clusters if c.is_singleton)
+        multi = n_clusters - n_singletons
+        sizes = [len(c.articles) for c in clusters]
+        avg_size = sum(sizes) / len(sizes) if sizes else 0.0
+        cross_lean = sum(1 for c in clusters if c.has_cross_lean_coverage)
+        logger.info(
+            "Clustered %d articles → %d clusters "
+            "(singletons kept: %d, dropped: %d | multi-source: %d | "
+            "avg size: %.1f | cross-lean: %d)",
+            len(articles), n_clusters,
+            n_singletons, dropped_singletons,
+            multi, avg_size, cross_lean,
+        )
+
+    def _within_age_window(
+        self,
+        a: ParsedArticle,
+        b: ParsedArticle,
+        delta: timedelta,
+    ) -> bool:
+        """Return True if both articles fall within the given age delta.
 
         If either timestamp is missing, the gate is skipped (returns True) so
         articles without publication dates are never excluded solely on age.
@@ -157,12 +272,11 @@ class StoryClusterer:
         ts_b = b.raw.published_at
         if ts_a is None or ts_b is None:
             return True
-        # Normalise both to UTC-aware for safe comparison
         if ts_a.tzinfo is None:
             ts_a = ts_a.replace(tzinfo=timezone.utc)
         if ts_b.tzinfo is None:
             ts_b = ts_b.replace(tzinfo=timezone.utc)
-        return abs(ts_a - ts_b) <= self._max_age_delta
+        return abs(ts_a - ts_b) <= delta
 
     def _make_cluster(self, cid: int, members: list[ParsedArticle]) -> StoryCluster:
         topic = self._dominant_topic(members)
@@ -183,13 +297,7 @@ class StoryClusterer:
 
     @staticmethod
     def _tier(region: str) -> str:
-        """Map a RawArticle.region value to a display tier string.
-
-        RawArticle.region holds the raw string from sources.yaml
-        ('national' | 'north_carolina' | 'lee_county_nc' | ...).
-        StoryCluster.tiers expects the human-readable tier labels used
-        throughout the pipeline ('national' | 'state' | 'local').
-        """
+        """Map a RawArticle.region value to a display tier string."""
         if region == "national":
             return "national"
         if region == "north_carolina":

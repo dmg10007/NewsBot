@@ -102,14 +102,31 @@ deduplication:
 
 clustering:
   model: all-MiniLM-L6-v2
-  # Raised from 0.65 -> 0.82. Articles must now be substantially more alike
-  # to be grouped. This is the primary lever for reducing cluster count.
-  similarity_threshold: 0.82
-  # Reduced from 24 -> 12 hours. Prevents stale articles from a prior run
-  # from merging with fresh ones and creating cross-period cluster noise.
-  max_age_delta_hours: 12
-  # Raised from 1 -> 2. Singleton clusters (1 article, 1 source) are almost
-  # always noise — wire stubs, opinion pieces, or hyper-local one-offs.
+
+  # Tuned down from 0.82 to 0.50.
+  # all-MiniLM-L6-v2 cosine scores for same-story articles across different
+  # sources typically land in the 0.45-0.65 range. The old value of 0.82
+  # was the primary cause of 289 clusters from 308 articles — nearly every
+  # article became a singleton because legitimate same-story pairs scored
+  # below the threshold. Start at 0.50 and dial up if over-merging occurs.
+  similarity_threshold: 0.50
+
+  # Per-tier age window. Articles must be published within this window to
+  # be merged into the same cluster. National stories (slow-burn) get a
+  # wider window; local stories (fast-cycling) get a tighter one.
+  # Scalar values (e.g. max_age_delta_hours: 48) are still accepted for
+  # backward compatibility and apply uniformly across all tiers.
+  max_age_delta_hours:
+    national: 72
+    state: 48
+    local: 24
+
+  # Singleton clusters (1 article) with importance_score below this value
+  # are dropped after clustering. Singletons are almost always wire stubs,
+  # opinion pieces, or hyper-local one-offs with no corroboration value.
+  # Set to 0.0 to disable and keep all singletons.
+  drop_singletons_below_importance: 0.4
+
   min_sources_to_report: 2
   cross_tier_boost: true
 
@@ -138,23 +155,10 @@ summarizer:
   cluster_timeout_seconds: 120
 
   # --- Perplexity rate-limit controls ---
-  # Reduced from 5 -> 3. Fewer parallel workers = narrower burst window.
   max_concurrent_summaries: 3
-  # Enforced pause between consecutive Perplexity calls across all workers.
-  # 1.2s keeps throughput reasonable while staying under typical RPM limits.
   pplx_call_delay_seconds: 1.2
-  # Hard cap on Perplexity calls per digest run. Clusters over the cap
-  # receive the extractive fallback (first 3 sentences). Mirrors the
-  # bias module's max_llm_calls_per_run behaviour.
   pplx_max_calls_per_run: 15
-  # Clusters below this importance score skip Perplexity entirely.
-  # Extractive fallback is adequate for low-signal stories.
-  # Range 0.0-1.0; set to 0.0 to disable gating.
   pplx_min_importance_score: 0.3
-  # Retry settings for 429 / transient errors. The summarizer will retry
-  # up to pplx_retry_attempts times before falling back to extractive.
-  # Delay follows exponential backoff: pplx_retry_base_delay * 2^attempt.
-  # Respects Retry-After header when present.
   pplx_retry_attempts: 3
   pplx_retry_base_delay: 2.0
 

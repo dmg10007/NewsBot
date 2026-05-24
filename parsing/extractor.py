@@ -53,6 +53,10 @@ _TOPIC_KEYWORDS: dict[str, list[str]] = {
     ],
 }
 
+# Maximum characters of body text used in cluster_text.
+# Captures the lead paragraph without pulling in tangential body content.
+_CLUSTER_LEAD_CHARS = 500
+
 
 @dataclass
 class ParsedArticle:
@@ -64,7 +68,19 @@ class ParsedArticle:
     sentiment_compound: float         # VADER compound score: -1.0 to 1.0
     sentiment_label: str              # positive | negative | neutral
     word_count: int
-    full_text: str                    # headline + summary concatenated for embedding
+    full_text: str                    # headline + summary concatenated (used for display/bias)
+
+    @property
+    def cluster_text(self) -> str:
+        """Focused input for sentence-transformer embedding.
+
+        Uses headline + first _CLUSTER_LEAD_CHARS chars of the body rather
+        than the full article text. Lead paragraphs are far more semantically
+        consistent across sources covering the same story than full body text,
+        which diverges due to quotes, bylines, and tangential context.
+        """
+        lead = (self.full_text or "")[:_CLUSTER_LEAD_CHARS]
+        return f"{self.raw.headline}. {lead}".strip()
 
 
 class ArticleExtractor:
