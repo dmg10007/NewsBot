@@ -51,7 +51,7 @@ import logging
 import os
 import re
 from concurrent.futures import Future, ThreadPoolExecutor, TimeoutError as FutureTimeoutError
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional
 
 import httpx
@@ -66,7 +66,6 @@ MAX_INPUT_CHARS = 4000
 _PPLX_API_URL = "https://api.perplexity.ai/chat/completions"
 _PPLX_MODEL = "sonar"
 
-# Defaults used when settings keys are absent
 _DEFAULT_READ_TIMEOUT = 45.0
 _DEFAULT_CONNECT_TIMEOUT = 10.0
 _DEFAULT_MAX_WORKERS = 5
@@ -85,6 +84,11 @@ class SummarizedCluster:
     tiers: list[str]
     source_count: int
     has_cross_lean_coverage: bool
+    # (source_name, article_url) pairs — one per article in the cluster.
+    # Used by the email renderer to build linked source chips.
+    source_links: list[tuple[str, str]] = field(default_factory=list)
+    # {source_name: lean_label} map for bias color rendering in the email.
+    source_bias: dict[str, str] = field(default_factory=dict)
     fallback_used: bool = False
 
 
@@ -93,7 +97,6 @@ class ArticleFetcher:
 
     def __init__(self, timeout: float = 15.0, user_agent: str = "NewsBot/1.0") -> None:
         self._client = httpx.Client(
-            # Explicit Timeout object so both connect and read are bounded.
             timeout=httpx.Timeout(connect=10.0, read=timeout, write=10.0, pool=5.0),
             headers={"User-Agent": user_agent},
             follow_redirects=True,
@@ -169,8 +172,6 @@ class Summarizer:
 
         user_agent = self.settings["ingestion"]["user_agent"]
 
-        # Explicit Timeout object — flat float only sets the connect timeout
-        # in httpx, leaving the read phase unbounded (the source of hangs).
         self._client = httpx.Client(
             timeout=httpx.Timeout(
                 connect=connect_timeout,
@@ -192,28 +193,12 @@ class Summarizer:
         self.close()
 
     def close(self) -> None:
-        """Release all underlying httpx connection pools.
-
-        Must be called when the Summarizer is no longer needed, unless the
-        instance is used as a context manager (which calls this automatically).
-        The scheduler should use:
-
-            with Summarizer() as s:
-                results = s.summarize_all(clusters)
-        """
         self._client.close()
         self._article_fetcher.close()
         self._brave.close()
 
     def summarize_all(self, clusters: list[StoryCluster]) -> list[SummarizedCluster]:
-        """Summarize every cluster in parallel. Returns results in input order.
-
-        Uses a ThreadPoolExecutor bounded by settings.summarizer.max_concurrent_summaries
-        (default 5) so Perplexity calls run concurrently rather than serially.
-        Each future has an individual wall-clock deadline
-        (settings.summarizer.cluster_timeout_seconds, default 120 s) so a
-        single slow or hanging cluster cannot block the entire run.
-        """
+        """Summarize every cluster in parallel. Returns results in input order."""
         results: list[Optional[SummarizedCluster]] = [None] * len(clusters)
 
         with ThreadPoolExecutor(max_workers=self._max_workers) as pool:
@@ -233,18 +218,12 @@ class Summarizer:
                     )
                     results[idx] = self._fallback_summary(cluster)
                 except Exception as exc:
-                    logger.error(
-                        "Cluster %d raised unexpected error: %s",
-                        cluster.cluster_id,
-                        exc,
-                    )
+                    logger.error("Cluster %d raised unexpected error: %s", cluster.cluster_id, exc)
                     results[idx] = self._fallback_summary(cluster)
 
-        # Filter out any None slots (should never occur, but be defensive)
         return [r for r in results if r is not None]
 
     def _summarize_cluster_safe(self, cluster: StoryCluster) -> SummarizedCluster:
-        """Wrapper that guarantees a SummarizedCluster is always returned."""
         try:
             return self._summarize_cluster(cluster)
         except Exception as exc:
@@ -271,14 +250,24 @@ class Summarizer:
             except Exception as exc:
                 logger.warning(
                     "LLM summarization failed for cluster %d: %s",
-                    cluster.cluster_id,
-                    exc,
+                    cluster.cluster_id, exc,
                 )
                 summary = self._extractive_fallback(input_text)
                 fallback = True
         else:
             summary = self._extractive_fallback(input_text)
             fallback = True
+
+        # Build source_links and source_bias for the renderer
+        source_links: list[tuple[str, str]] = [
+            (a.raw.source_name, a.raw.url)
+            for a in cluster.articles
+            if a.raw.url
+        ]
+        source_bias: dict[str, str] = {
+            a.raw.source_name: (a.raw.bias_lean or "unknown")
+            for a in cluster.articles
+        }
 
         return SummarizedCluster(
             cluster_id=cluster.cluster_id,
@@ -290,6 +279,8 @@ class Summarizer:
             tiers=cluster.tiers,
             source_count=cluster.source_count,
             has_cross_lean_coverage=cluster.has_cross_lean_coverage,
+            source_links=source_links,
+            source_bias=source_bias,
             fallback_used=fallback,
         )
 
@@ -298,9 +289,8 @@ class Summarizer:
         for article in cluster.articles:
             full_text = self._article_fetcher.fetch(article.raw.url)
             text = full_text if full_text else article.raw.summary
-            # Strip source name from prompt to avoid priming LLM with
-            # outlet identity (see code review item #9)
-            parts.append(text)
+            # Source names excluded from prompt — see code review item #9
+            parts.append(text or "")
         return "\n\n---\n\n".join(parts)
 
     def _call_perplexity(self, input_text: str) -> str:
@@ -310,14 +300,14 @@ class Summarizer:
                 {
                     "role": "system",
                     "content": (
-                        "You are a neutral news summarizer. Produce a concise 3-5 sentence "
+                        "You are a neutral news summarizer. Produce a concise 2-3 sentence "
                         "summary containing only verifiable facts. Remove editorial framing, "
                         "emotional language, and opinion. Use plain, direct language."
                     ),
                 },
                 {"role": "user", "content": input_text},
             ],
-            "max_tokens": 300,
+            "max_tokens": 150,
             "temperature": 0.1,
         }
         response = self._client.post(
@@ -336,16 +326,17 @@ class Summarizer:
         return " ".join(sentences[:3])
 
     def _fallback_summary(self, cluster: StoryCluster) -> SummarizedCluster:
-        headline = cluster.representative_headline
         return SummarizedCluster(
             cluster_id=cluster.cluster_id,
-            headline=headline,
-            summary=headline,
+            headline=cluster.representative_headline,
+            summary=cluster.representative_headline,
             sources=list({a.raw.source_name for a in cluster.articles}),
             bias_notes="",
             importance_score=cluster.importance_score,
             tiers=cluster.tiers,
             source_count=cluster.source_count,
             has_cross_lean_coverage=cluster.has_cross_lean_coverage,
+            source_links=[(a.raw.source_name, a.raw.url) for a in cluster.articles if a.raw.url],
+            source_bias={a.raw.source_name: (a.raw.bias_lean or "unknown") for a in cluster.articles},
             fallback_used=True,
         )
