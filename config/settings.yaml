@@ -1,26 +1,11 @@
 # NewsBot Settings
 # Sensitive values (API keys, email addresses) must be set in .env
 # This file contains only non-sensitive configuration.
-#
-# Key naming contract (settings.yaml top-level key -> Python module that reads it):
-#   app           -> config/loader.py
-#   schedule      -> scheduler/scheduler.py (digest times)
-#   topics        -> scheduler/scheduler.py (story caps)
-#   geography     -> ingestion/pipeline.py
-#   ingestion     -> ingestion/fetcher.py, ingestion/scraper.py
-#   deduplication -> ingestion/deduplicator.py
-#   clustering    -> clustering/clusterer.py
-#   bias          -> bias/llm_analyzer.py, bias/framing.py
-#   summarizer    -> summarizer/summarizer.py
-#   delivery      -> scheduler/scheduler.py, delivery/email_sender.py,
-#                    delivery/email_renderer.py
-#   scheduler     -> scheduler/scheduler.py (cron expressions)
-#   scoring       -> scheduler/scheduler.py (story ranking)
 
 app:
   name: NewsBot
   timezone: America/New_York
-  log_level: INFO  # DEBUG | INFO | WARNING | ERROR
+  log_level: INFO
 
 schedule:
   morning_digest:
@@ -47,6 +32,59 @@ geography:
   local: lee_county_nc
   local_boost: 1.5
 
+# Story-level geo classification (replaces source-level region as primary signal)
+# Keywords lists are case-insensitive substring matches (word-boundary for tokens <= 3 chars)
+geo_filter:
+  exclude_international: true
+  keywords:
+    local:
+      - "lee county"
+      - "sanford"
+      - "harnett"
+      - "broadway nc"
+      - "angier"
+      - "fuquay"
+      - "chatham county"
+    state:
+      - "north carolina"
+      - " nc "
+      - "raleigh"
+      - "charlotte"
+      - "durham"
+      - "chapel hill"
+      - "wilmington nc"
+      - "asheville"
+      - "greensboro"
+      - "winston-salem"
+      - "fayetteville nc"
+      - "cary nc"
+    international:
+      - "ukraine"
+      - "russia"
+      - "china"
+      - "beijing"
+      - "moscow"
+      - "london"
+      - "paris"
+      - "berlin"
+      - "tokyo"
+      - "seoul"
+      - "israel"
+      - "gaza"
+      - "iran"
+      - "iraq"
+      - "syria"
+      - "india"
+      - "pakistan"
+      - "brazil"
+      - "mexico"
+      - "canada"
+      - "australia"
+      - "european union"
+      - "nato"
+      - "united nations"
+      - "kremlin"
+
 ingestion:
   request_timeout_seconds: 15
   max_retries: 3
@@ -62,7 +100,12 @@ deduplication:
 
 clustering:
   model: all-MiniLM-L6-v2
-  similarity_threshold: 0.72
+  # Lower threshold catches same-event stories written differently across outlets.
+  # 0.65 is the recommended floor; go lower only if duplicates persist.
+  similarity_threshold: 0.65
+  # Articles published more than this many hours apart won't be merged,
+  # even if semantically similar. Prevents topic-drift across days.
+  max_age_delta_hours: 24
   min_sources_to_report: 1
   cross_tier_boost: true
 
@@ -74,34 +117,28 @@ bias:
   llm_model: sonar
   llm_fallback: local
   llm_fallback_model: llama3
+  # Perplexity API call cap per run. After this many Perplexity calls,
+  # remaining clusters are routed to the local model automatically.
+  # Set skip_after_cap: true to revert to the old skip behaviour.
   max_llm_calls_per_run: 20
+  skip_after_cap: false
 
 summarizer:
   provider: local
   model: llama3
   max_summary_tokens: 150
   neutral_prompt_version: v1
-  request_timeout_seconds: 60.0
+  request_timeout_seconds: 45
+  connect_timeout_seconds: 10
   article_fetch_timeout_seconds: 15.0
   brave_enrich_threshold: 0.7
+  max_concurrent_summaries: 5
+  cluster_timeout_seconds: 120
 
 # delivery structure:
-#
-#   delivery.<period>.email.enabled   -- scheduler.py per-period on/off switch
-#   delivery.<period>.telegram.enabled
-#
+#   delivery.<period>.email.enabled   -- per-period on/off switch
 #   delivery.email.*                  -- email_sender.py + email_renderer.py
-#   delivery.telegram.*               -- reserved for future telegram config
-#
-# Python access pattern (email_sender.py):
-#   settings["delivery"]["email"]["max_recipients"]
-#   settings["delivery"]["email"]["subject_morning"]
-# Python access pattern (email_renderer.py):
-#   settings["delivery"]["email"]["bias_tag_colors"]
-# Python access pattern (scheduler.py):
-#   settings["delivery"].get(period, {}).get("email", {}).get("enabled")
 delivery:
-  # Per-period on/off switches
   morning:
     email:
       enabled: true
@@ -118,9 +155,10 @@ delivery:
     telegram:
       enabled: false
 
-  # Shared email config -- read by email_sender.py and email_renderer.py
   email:
     max_recipients: 5
+    # Max stories shown per geographic section (national / state / local)
+    max_stories_per_category: 7
     subject_morning: "NewsBot Morning Briefing - {date}"
     subject_evening: "NewsBot Evening Briefing - {date}"
     bias_tag_colors:
@@ -131,7 +169,6 @@ delivery:
       right:        "#b71c1c"
       unknown:      "#757575"
 
-  # Shared telegram config -- read by telegram_bot.py (currently uses env vars only)
   telegram:
     parse_mode: HTML
 

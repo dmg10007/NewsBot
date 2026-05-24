@@ -1,7 +1,7 @@
 """Stage 3 bias detection: LLM-assisted cross-source claim analysis.
 
 Only called for clusters that passed lexicon.py escalation threshold.
-Uses Perplexity Sonar as primary, with llama.cpp as fallback.
+Uses Perplexity Sonar as primary, with local llama.cpp as fallback.
 
 Outputs:
   - A list of factual claims extracted from the cluster
@@ -18,28 +18,29 @@ source's political identity rather than the actual content, which works
 against the goal of neutral framing analysis. The LLM sees only anonymized
 ARTICLE_N labels, headlines, and summaries.
 
+LLM call cap
+------------
+max_calls gates Perplexity API calls only. After the cap is hit, remaining
+clusters are automatically routed to the local llama.cpp model instead of
+being skipped. This ensures every cluster receives framing analysis —
+either via Perplexity (highest quality, capped) or local model (unlimited).
+
+To change this behaviour and hard-skip after the cap, set
+bias.skip_after_cap: true in settings.yaml.
+
 Perplexity model history:
   sonar-reasoning      -> DEPRECATED (400 Bad Request)
   sonar                -> Current standard model (used here)
   sonar-reasoning-pro  -> Higher quality, higher cost alternative
 
-LLM call cap:
-  Default is 50 per run. Override via LLMAnalyzer(max_calls=N) or expose
-  in settings.yaml under bias.max_llm_calls_per_run.
-
 Prompt token budget:
   Article summaries are truncated to _SUMMARY_PREVIEW_CHARS (300) in the
-  prompt. This keeps input tokens reasonable: a 10-article cluster costs
-  ~1,800 input tokens instead of ~5,000+ with full summaries, while still
-  giving the model sufficient context for framing analysis.
+  prompt. This keeps input tokens reasonable (~1,800 vs 5,000+ per cluster).
 
 Security note:
   Auth header exposure is prevented by suppressing httpx debug-level
   logging via the 'httpx' logger. httpx only logs headers at DEBUG; since
   the bot runs at INFO by default, the key never appears in logs.
-  A previous approach using an httpx request hook was removed because hooks
-  mutate the live request object — the hook was replacing the real Bearer
-  token with '[REDACTED]' before the request was sent, causing 401 errors.
 """
 
 from __future__ import annotations
@@ -53,18 +54,17 @@ import httpx
 
 from bias.framing import FramingResult
 from clustering.clusterer import StoryCluster
+from config.loader import get_settings
 
 logger = logging.getLogger(__name__)
 
-# Suppress httpx's own debug logging to prevent Authorization headers from
-# appearing in log output if the root log level is ever set to DEBUG.
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 _PPLX_API_URL = "https://api.perplexity.ai/chat/completions"
 _PPLX_MODEL = "sonar"
 _LLAMA_DEFAULT_BASE_URL = "http://localhost:8080"
-_DEFAULT_MAX_CALLS = 50
+_DEFAULT_MAX_CALLS = 20
 _SUMMARY_PREVIEW_CHARS = 300
 
 
@@ -79,10 +79,20 @@ class LLMAnalysisResult:
 
 
 class LLMAnalyzer:
-    """Calls Perplexity Sonar or local llama.cpp for bias/framing analysis."""
+    """Calls Perplexity Sonar (capped) then local llama.cpp for bias/framing analysis.
+
+    After max_calls Perplexity calls have been made, all further clusters
+    are routed to the local model rather than being skipped. Set
+    bias.skip_after_cap: true in settings.yaml to revert to the old
+    skip behaviour.
+    """
 
     def __init__(self, max_calls: int = _DEFAULT_MAX_CALLS) -> None:
-        self.max_calls = max_calls
+        settings = get_settings()
+        bias_cfg = settings.get("bias", {})
+
+        self.max_calls = int(bias_cfg.get("max_llm_calls_per_run", max_calls))
+        self._skip_after_cap: bool = bias_cfg.get("skip_after_cap", False)
         self._calls_made = 0
         self._pplx_key = os.getenv("PPLX_API_KEY", "")
         self._llama_model = os.getenv("LLAMA_CPP_MODEL", "llama3")
@@ -90,29 +100,42 @@ class LLMAnalyzer:
         raw_base = os.getenv("LLAMA_CPP_BASE_URL", _LLAMA_DEFAULT_BASE_URL)
         self._llama_base_url = re.sub(r"(/v1)?/?$", "", raw_base.rstrip("/"))
 
-        self._client = httpx.Client(timeout=60.0)
+        # Explicit Timeout object — flat float only sets connect timeout,
+        # leaving the read phase unbounded.
+        self._client = httpx.Client(
+            timeout=httpx.Timeout(connect=10.0, read=45.0, write=10.0, pool=5.0)
+        )
 
     def analyze(
         self,
         cluster: StoryCluster,
         framing: FramingResult,
     ) -> LLMAnalysisResult:
-        if self._calls_made >= self.max_calls:
-            logger.warning(
-                "LLM call cap (%d) reached — skipping cluster %d",
-                self.max_calls, cluster.cluster_id,
-            )
-            return LLMAnalysisResult(
-                cluster_id=cluster.cluster_id,
-                extracted_facts=[],
-                framing_notes=[],
-                bias_notes="Analysis skipped: daily LLM call limit reached.",
-                provider_used="none",
-                skipped=True,
-            )
-
         prompt = self._build_prompt(cluster, framing)
+        pplx_cap_reached = self._calls_made >= self.max_calls
 
+        if pplx_cap_reached:
+            if self._skip_after_cap:
+                logger.info(
+                    "Perplexity cap (%d) reached — skipping cluster %d (skip_after_cap=true)",
+                    self.max_calls, cluster.cluster_id,
+                )
+                return LLMAnalysisResult(
+                    cluster_id=cluster.cluster_id,
+                    extracted_facts=[],
+                    framing_notes=[],
+                    bias_notes="Analysis skipped: daily Perplexity call limit reached.",
+                    provider_used="none",
+                    skipped=True,
+                )
+            else:
+                logger.debug(
+                    "Perplexity cap (%d) reached — routing cluster %d to local model",
+                    self.max_calls, cluster.cluster_id,
+                )
+                return self._call_local_with_fallback(cluster, framing, prompt)
+
+        # Under cap: try Perplexity first, fall back to local on failure
         if self._pplx_key:
             try:
                 result = self._call_perplexity(cluster.cluster_id, prompt)
@@ -124,12 +147,24 @@ class LLMAnalyzer:
                     cluster.cluster_id, exc,
                 )
 
+        return self._call_local_with_fallback(cluster, framing, prompt)
+
+    def _call_local_with_fallback(
+        self,
+        cluster: StoryCluster,
+        framing: FramingResult,
+        prompt: str,
+    ) -> LLMAnalysisResult:
+        """Attempt local model; return minimal result if that also fails."""
         try:
             result = self._call_local(cluster.cluster_id, prompt)
             self._calls_made += 1
             return result
         except Exception as exc:
-            logger.error("Local LLM call also failed for cluster %d: %s", cluster.cluster_id, exc)
+            logger.error(
+                "Local LLM call also failed for cluster %d: %s",
+                cluster.cluster_id, exc,
+            )
             return LLMAnalysisResult(
                 cluster_id=cluster.cluster_id,
                 extracted_facts=[],
@@ -143,8 +178,6 @@ class LLMAnalyzer:
 
         Source names and bias-lean labels are intentionally excluded.
         Articles are labelled ARTICLE_1, ARTICLE_2, etc. only.
-        Summaries are truncated to _SUMMARY_PREVIEW_CHARS to keep input
-        token usage predictable.
         """
         articles_text = "\n\n".join(
             f"ARTICLE_{idx + 1}\n"
@@ -226,7 +259,6 @@ PREVIOUS ANALYSIS CONTEXT:
     def _parse_llm_response(
         self, cluster_id: int, content: str, provider: str
     ) -> LLMAnalysisResult:
-        """Parse structured LLM output into an LLMAnalysisResult."""
         facts: list[str] = []
         framing_notes: list[str] = []
         bias_notes = ""
