@@ -70,6 +70,13 @@ _TOPK_CAP_THRESHOLD = 2000
 _TOPK_CAP = 200
 
 
+def _to_utc(dt: datetime) -> datetime:
+    """Return dt as a tz-aware UTC datetime. Naive datetimes are assumed UTC."""
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
 class UnionFind:
     """Path-compressed Union-Find (disjoint-set) with union-by-rank.
 
@@ -124,8 +131,12 @@ class StoryCluster:
         self.bias_spread = list({
             a.raw.bias_lean for a in self.articles if a.raw.bias_lean != "unknown"
         })
+        # Normalize to UTC before comparison — RSS feeds produce a mix of
+        # tz-aware and tz-naive datetimes; min() raises TypeError on mixed lists.
         published_dates = [
-            a.raw.published_at for a in self.articles if a.raw.published_at
+            _to_utc(a.raw.published_at)
+            for a in self.articles
+            if a.raw.published_at is not None
         ]
         self.earliest_published = min(published_dates) if published_dates else None
         credibility_order = {"high": 0, "medium": 1, "low": 2}
@@ -208,12 +219,8 @@ class StoryClusterer:
                 if j == i:
                     continue
                 if hit["score"] < self._threshold:
-                    continue  # hits are score-sorted; could break, but not all impls guarantee it
+                    continue
                 tier_j = self._tier(articles[j].raw.region)
-                # Use the more restrictive (smaller) age window of the two tiers.
-                # Implication: a national story published 36h ago will NOT cluster
-                # with a new local story if the local tier window is 24h.
-                # See M-07 in the code review for the tradeoff discussion.
                 delta = min(
                     self._age_delta_for_tier(tier_i),
                     self._age_delta_for_tier(tier_j),
@@ -232,11 +239,6 @@ class StoryClusterer:
             for cid, members in cluster_map.items()
         ]
 
-        # Singleton filter — importance_score is 0.0 here (set post-construction
-        # by scoring.scorer.score_clusters in the scheduler). This is a
-        # conservative first pass that drops only definite low-value singletons.
-        # The scheduler calls score_clusters() before summarization, which may
-        # rescue singletons that score above the threshold after real scoring.
         before_filter = len(clusters)
         clusters = [
             c for c in clusters
@@ -273,20 +275,12 @@ class StoryClusterer:
         b: ParsedArticle,
         delta: timedelta,
     ) -> bool:
-        """Return True if both articles fall within the given age delta.
-
-        If either timestamp is missing, the gate is skipped (returns True) so
-        articles without publication dates are never excluded solely on age.
-        """
+        """Return True if both articles fall within the given age delta."""
         ts_a = a.raw.published_at
         ts_b = b.raw.published_at
         if ts_a is None or ts_b is None:
             return True
-        if ts_a.tzinfo is None:
-            ts_a = ts_a.replace(tzinfo=timezone.utc)
-        if ts_b.tzinfo is None:
-            ts_b = ts_b.replace(tzinfo=timezone.utc)
-        return abs(ts_a - ts_b) <= delta
+        return abs(_to_utc(ts_a) - _to_utc(ts_b)) <= delta
 
     def _make_cluster(self, cid: int, members: list[ParsedArticle]) -> StoryCluster:
         topic = self._dominant_topic(members)
