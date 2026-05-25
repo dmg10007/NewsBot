@@ -26,6 +26,13 @@ Summarizer lifecycle
 Summarizer is used as a context manager (`with Summarizer() as s`) so its
 three httpx.Client instances are always released, even when an exception
 occurs mid-run.
+
+Scoring
+-------
+score_clusters() is called between clustering (Stage 3) and bias analysis
+(Stage 4). It writes importance_score to each StoryCluster in place.
+Downstream consumers (Summarizer, LLMAnalyzer) read this value to decide
+whether to use Perplexity, Brave enrichment, or local fallback.
 """
 
 from __future__ import annotations
@@ -44,8 +51,9 @@ from delivery.email_renderer import EmailRenderer
 from delivery.email_sender import EmailSender
 from delivery.telegram_bot import TelegramSender
 from ingestion.pipeline import ingest_all_sources
-from monitoring.health import record_run          # was: monitoring.health_check (wrong module name)
+from monitoring.health import record_run
 from parsing.extractor import ArticleExtractor
+from scoring.scorer import score_clusters
 from summarizer.summarizer import Summarizer
 
 logger = logging.getLogger(__name__)
@@ -130,6 +138,14 @@ def _run_digest_inner(period: str) -> None:
     clusterer = StoryClusterer()
     clusters = clusterer.cluster(parsed)
     logger.info("Produced %d story clusters", len(clusters))
+
+    # Stage 3b: Score clusters
+    # Must run before any downstream consumer checks importance_score.
+    # Fixes three silent cascade failures (H-01):
+    #   - Singleton filter in clusterer uses 0.0 score without this → drops all singletons
+    #   - Summarizer Perplexity gate: 0.0 >= pplx_min_importance_score is always False
+    #   - Brave Search enrichment gate: 0.0 >= brave_enrich_threshold is always False
+    clusters = score_clusters(clusters, settings)
 
     # Stage 4: Framing analysis (lexicon-based, no LLM)
     framing_analyzer = FramingAnalyzer()

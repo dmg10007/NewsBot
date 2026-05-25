@@ -110,7 +110,13 @@ class StoryCluster:
     source_count: int = field(init=False)
     bias_spread: list[str] = field(init=False)  # Unique bias_lean values present
     earliest_published: Optional[datetime] = field(init=False)
-    importance_score: float = 0.0     # Computed by scorer — higher = more prominent
+
+    # importance_score is intentionally NOT settable via the constructor.
+    # It is computed post-construction by scoring.scorer.score_clusters()
+    # and written back in place. Using field(init=False) prevents accidental
+    # override if StoryCluster is constructed with a keyword argument.
+    importance_score: float = field(init=False, default=0.0)
+
     representative_headline: str = field(init=False)
 
     def __post_init__(self) -> None:
@@ -204,7 +210,10 @@ class StoryClusterer:
                 if hit["score"] < self._threshold:
                     continue  # hits are score-sorted; could break, but not all impls guarantee it
                 tier_j = self._tier(articles[j].raw.region)
-                # Use the more restrictive (smaller) age window of the two tiers
+                # Use the more restrictive (smaller) age window of the two tiers.
+                # Implication: a national story published 36h ago will NOT cluster
+                # with a new local story if the local tier window is 24h.
+                # See M-07 in the code review for the tradeoff discussion.
                 delta = min(
                     self._age_delta_for_tier(tier_i),
                     self._age_delta_for_tier(tier_j),
@@ -223,10 +232,11 @@ class StoryClusterer:
             for cid, members in cluster_map.items()
         ]
 
-        # Singleton filter — applied after importance scoring in the pipeline,
-        # but importance_score defaults to 0.0 here so low-score singletons
-        # are caught immediately. The scheduler re-runs importance scoring
-        # before summarization, so this is a conservative first pass.
+        # Singleton filter — importance_score is 0.0 here (set post-construction
+        # by scoring.scorer.score_clusters in the scheduler). This is a
+        # conservative first pass that drops only definite low-value singletons.
+        # The scheduler calls score_clusters() before summarization, which may
+        # rescue singletons that score above the threshold after real scoring.
         before_filter = len(clusters)
         clusters = [
             c for c in clusters
