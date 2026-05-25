@@ -3,41 +3,35 @@
 Builds a normalized lookup table: domain -> {bias_lean, factuality, confidence}.
 Designed to be called once at startup (or weekly via cron) and cached in memory.
 
-No paid API required:
-  AllSides  — rendered via Playwright headless Chromium to bypass Cloudflare WAF.
-              Falls back to _ALLSIDES_STATIC if Playwright is unavailable.
-  MBFC      — scrapes public search + detail pages via httpx (sequential, rate-limited)
+Both AllSides and MBFC now use Playwright headless Chromium. Both sites run
+Cloudflare bot detection that blocks plain httpx requests. A real browser
+instance passes TLS fingerprinting and JS challenge checks that Cloudflare
+uses to distinguish browsers from scripts.
 
-AllSides / Cloudflare note
---------------------------
-AllSides runs Cloudflare bot detection that blocks plain httpx requests with a 403.
-A real Chromium instance (via Playwright) passes fingerprinting checks that
-Cloudflare uses to distinguish browsers from scripts. headless=True is sufficient
-because Cloudflare checks TLS JA3 fingerprints and JS challenge responses, both of
-which Playwright satisfies.
+A single Playwright browser instance is shared across all scraping in one
+refresh run. Use scrape_all() to get both sources in one browser session.
+The individual scrape_allsides() and scrape_mbfc_bulk() entry points are
+kept for backwards compatibility and each launch their own browser.
 
-If playwright is not installed or Chromium is unavailable, scrape_allsides() falls
-back to _ALLSIDES_STATIC — a hardcoded table of ratings for the sources in
-config/sources.yaml. Update this table when you add new sources.
-
-To install Playwright:
+Install:
     pip install playwright
     playwright install chromium
 
+Fallback behaviour
+------------------
+If Playwright is not installed or Chromium fails to launch:
+  - AllSides  → _ALLSIDES_STATIC  (hardcoded May 2026 ratings)
+  - MBFC      → empty dict  (resolver falls back to _FALLBACK_RATINGS)
+
 MBFC crawl posture
 ------------------
-MBFC is a small WordPress site. We scrape it sequentially (max_concurrent=1)
-with a 2.0s delay between domains for the weekly cron path. The semaphore
-architecture is kept so max_concurrent can be raised if needed, but the
-default is deliberately conservative to avoid 429s.
-
-Each domain requires 2 HTTP requests: search page + detail page.
-For 17 domains at 2.0s delay: ~35s total — acceptable for a weekly job.
+MBFC is a small WordPress site. Pages are loaded sequentially with a
+configurable delay (default 1.5s). Each domain requires 2 page loads:
+search page + detail page. For 17 domains: ~51s total.
 """
 
 from __future__ import annotations
 
-import asyncio
 import logging
 import re
 import time
@@ -49,25 +43,16 @@ from bs4 import BeautifulSoup
 
 logger = logging.getLogger(__name__)
 
-# Full browser header set used for MBFC requests.
+# Retained for backwards compatibility — used by refresh.py for AllSides client
+# (now unused at runtime, but kept so existing imports don’t break).
 _BROWSER_HEADERS: dict[str, str] = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
         "Chrome/124.0.0.0 Safari/537.36"
     ),
-    "Accept": (
-        "text/html,application/xhtml+xml,application/xml;q=0.9,"
-        "image/avif,image/webp,image/apng,*/*;q=0.8"
-    ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "Accept-Language": "en-US,en;q=0.9",
-    "Accept-Encoding": "gzip, deflate, br",
-    "Sec-Fetch-Dest": "document",
-    "Sec-Fetch-Mode": "navigate",
-    "Sec-Fetch-Site": "none",
-    "Sec-Fetch-User": "?1",
-    "Upgrade-Insecure-Requests": "1",
-    "Cache-Control": "max-age=0",
 }
 
 # ---------------------------------------------------------------------------
@@ -76,6 +61,8 @@ _BROWSER_HEADERS: dict[str, str] = {
 
 BIAS_SCALE = ("left", "center-left", "center", "center-right", "right")
 FACTUALITY_SCALE = ("very-low", "low", "mixed", "mostly-factual", "high", "very-high")
+
+MBFC_MATCH_THRESHOLD = 0.85  # minimum string similarity for MBFC search result acceptance
 
 
 @dataclass
@@ -119,7 +106,26 @@ _ALLSIDES_STATIC: dict[str, str] = {
 
 
 # ---------------------------------------------------------------------------
-# AllSides scraper — Playwright (primary path)
+# Shared Playwright browser context factory
+# ---------------------------------------------------------------------------
+
+def _make_playwright_context(pw):
+    """Return a (browser, context) pair with a realistic desktop profile."""
+    browser = pw.chromium.launch(headless=True)
+    context = browser.new_context(
+        viewport={"width": 1280, "height": 800},
+        locale="en-US",
+        user_agent=(
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/124.0.0.0 Safari/537.36"
+        ),
+    )
+    return browser, context
+
+
+# ---------------------------------------------------------------------------
+# AllSides scraper — Playwright
 # ---------------------------------------------------------------------------
 
 _ALLSIDES_BIAS_MAP: dict[str, str] = {
@@ -141,10 +147,7 @@ def _normalize_allsides_bias(raw: str) -> Optional[str]:
 
 
 def _parse_allsides_html(html: str) -> dict[str, str]:
-    """Parse the AllSides ratings table from raw HTML.
-
-    Shared by the Playwright path and any future path that can supply HTML.
-    """
+    """Parse the AllSides ratings table from raw HTML."""
     ratings: dict[str, str] = {}
     soup = BeautifulSoup(html, "lxml")
     table = soup.find("table", {"class": re.compile(r"views-table")})
@@ -171,71 +174,58 @@ def _parse_allsides_html(html: str) -> dict[str, str]:
         if normalized:
             ratings[domain] = normalized
 
-    logger.info("AllSides: scraped %d source ratings via Playwright", len(ratings))
+    logger.info("AllSides: scraped %d source ratings", len(ratings))
+    return ratings
+
+
+def _scrape_allsides_with_context(context) -> dict[str, str]:
+    """Scrape AllSides using an existing Playwright browser context."""
+    from playwright.sync_api import TimeoutError as PWTimeout
+    url = "https://www.allsides.com/media-bias/ratings"
+    try:
+        page = context.new_page()
+        page.goto(url, wait_until="networkidle", timeout=30_000)
+        html = page.content()
+        page.close()
+    except PWTimeout:
+        logger.warning("AllSides: page load timed out — using static fallback")
+        return dict(_ALLSIDES_STATIC)
+    except Exception as exc:
+        logger.warning("AllSides: page load failed (%s) — using static fallback", exc)
+        return dict(_ALLSIDES_STATIC)
+
+    ratings = _parse_allsides_html(html)
+    if not ratings:
+        logger.warning("AllSides: parsed 0 ratings — using static fallback")
+        return dict(_ALLSIDES_STATIC)
     return ratings
 
 
 def scrape_allsides(client: httpx.Client) -> dict[str, str]:
     """Scrape AllSides ratings using Playwright headless Chromium.
 
-    Playwright is required to pass Cloudflare bot detection on allsides.com.
-    If playwright or its Chromium browser is not installed, logs a warning and
-    returns the static fallback table instead.
-
-    `client` is accepted for API compatibility but not used — Playwright
-    manages its own browser-level networking.
-
-    Install:
-        pip install playwright
-        playwright install chromium
+    `client` is accepted for API compatibility but not used.
+    Falls back to _ALLSIDES_STATIC if Playwright is unavailable.
     """
     try:
-        from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
+        from playwright.sync_api import sync_playwright
     except ImportError:
         logger.warning(
-            "AllSides: playwright not installed — using static fallback table. "
+            "AllSides: playwright not installed — using static fallback. "
             "Run: pip install playwright && playwright install chromium"
         )
         return dict(_ALLSIDES_STATIC)
 
-    url = "https://www.allsides.com/media-bias/ratings"
-
     try:
         with sync_playwright() as pw:
-            browser = pw.chromium.launch(headless=True)
-            context = browser.new_context(
-                # Mimic a real desktop browser viewport + locale
-                viewport={"width": 1280, "height": 800},
-                locale="en-US",
-                user_agent=(
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/124.0.0.0 Safari/537.36"
-                ),
-            )
-            page = context.new_page()
-            # wait_until="networkidle" ensures JS-rendered content (including
-            # any Cloudflare challenge resolution) is complete before we read.
-            page.goto(url, wait_until="networkidle", timeout=30_000)
-            html = page.content()
-            browser.close()
-    except PWTimeout:
-        logger.warning(
-            "AllSides: Playwright timed out loading ratings page — using static fallback"
-        )
-        return dict(_ALLSIDES_STATIC)
+            browser, context = _make_playwright_context(pw)
+            try:
+                return _scrape_allsides_with_context(context)
+            finally:
+                browser.close()
     except Exception as exc:
-        logger.warning(
-            "AllSides: Playwright scrape failed (%s) — using static fallback", exc
-        )
+        logger.warning("AllSides: Playwright launch failed (%s) — using static fallback", exc)
         return dict(_ALLSIDES_STATIC)
-
-    ratings = _parse_allsides_html(html)
-    if not ratings:
-        logger.warning("AllSides: Playwright returned HTML but parse yielded 0 ratings — using static fallback")
-        return dict(_ALLSIDES_STATIC)
-
-    return ratings
 
 
 def _extract_domain_allsides(name_cell, bias_cell) -> Optional[str]:
@@ -285,7 +275,6 @@ _OUTLET_DOMAIN_MAP: dict[str, str] = {
     "carolina public press": "carolinapublicpress.org",
 }
 
-# Map domain -> preferred MBFC search term when the domain slug gives bad results.
 _MBFC_SEARCH_MAP: dict[str, str] = {
     "apnews.com": "associated press",
     "wsj.com": "wall street journal",
@@ -305,7 +294,7 @@ _MBFC_SEARCH_MAP: dict[str, str] = {
 
 
 # ---------------------------------------------------------------------------
-# MBFC scrapers
+# MBFC scraper — Playwright
 # ---------------------------------------------------------------------------
 
 _MBFC_BIAS_MAP: dict[str, str] = {
@@ -337,33 +326,34 @@ _MBFC_PROFILE_RE = re.compile(
 
 
 def _is_mbfc_profile_url(url: str) -> bool:
-    """Return True only for source-profile URLs (single slug, no sub-paths)."""
     return bool(_MBFC_PROFILE_RE.match(url))
 
 
-# --- Async implementation ---
+def _scrape_mbfc_domain_with_context(context, domain: str) -> Optional[dict]:
+    """Scrape MBFC for a single domain using an existing Playwright context.
 
-async def scrape_mbfc_source_async(
-    client: httpx.AsyncClient,
-    domain: str,
-) -> Optional[dict]:
-    """Async: scrape MBFC rating for a single domain via their search.
-
-    Returns: {bias: str, factuality: str} or None.
-    Makes 2 HTTP requests: search page, then first *profile* result page.
+    Two page loads: MBFC search → first profile result.
+    Returns {bias, factuality} or None.
     """
+    from playwright.sync_api import TimeoutError as PWTimeout
+
     search_term = _MBFC_SEARCH_MAP.get(domain, domain.split(".")[0])
     search_url = f"https://mediabiasfactcheck.com/?s={search_term.replace(' ', '+')}"
 
+    # --- Search page ---
     try:
-        resp = await client.get(search_url, timeout=15)
-        resp.raise_for_status()
+        page = context.new_page()
+        page.goto(search_url, wait_until="domcontentloaded", timeout=20_000)
+        search_html = page.content()
+        page.close()
+    except PWTimeout:
+        logger.debug("MBFC: search page timed out for %s", domain)
+        return None
     except Exception as exc:
-        logger.debug("MBFC search failed for %s: %s", domain, exc)
+        logger.debug("MBFC: search page failed for %s: %s", domain, exc)
         return None
 
-    soup = BeautifulSoup(resp.text, "lxml")
-
+    soup = BeautifulSoup(search_html, "lxml")
     detail_url: Optional[str] = None
     for a in soup.select("h2.entry-title a, h3.entry-title a, .post-title a, article a"):
         href = a.get("href", "")
@@ -372,85 +362,125 @@ async def scrape_mbfc_source_async(
             break
 
     if not detail_url:
-        logger.debug(
-            "MBFC: no profile link found for %s (search_term=%r). HTML snippet: %s",
-            domain,
-            search_term,
-            resp.text[:600].replace("\n", " "),
-        )
-        logger.warning("MBFC: no result for %s", domain)
+        logger.warning("MBFC: no profile result for %s (searched %r)", domain, search_term)
         return None
 
+    # --- Detail page ---
     try:
-        detail_resp = await client.get(detail_url, timeout=15)
-        detail_resp.raise_for_status()
+        page = context.new_page()
+        page.goto(detail_url, wait_until="domcontentloaded", timeout=20_000)
+        detail_html = page.content()
+        page.close()
+    except PWTimeout:
+        logger.debug("MBFC: detail page timed out for %s", domain)
+        return None
     except Exception as exc:
-        logger.debug("MBFC detail fetch failed for %s: %s", detail_url, exc)
+        logger.debug("MBFC: detail page failed for %s: %s", domain, exc)
         return None
 
-    detail_soup = BeautifulSoup(detail_resp.text, "lxml")
-    return _parse_mbfc_detail(detail_soup, domain)
+    return _parse_mbfc_detail(BeautifulSoup(detail_html, "lxml"), domain)
 
 
-async def scrape_mbfc_bulk_async(
-    domains: list[str],
-    delay: float = 2.0,
-    max_concurrent: int = 1,
-) -> dict[str, dict]:
-    """Async: scrape MBFC for a list of domains with concurrency control.
+def scrape_mbfc_bulk(client: httpx.Client, domains: list[str], delay: float = 1.5) -> dict[str, dict]:
+    """Scrape MBFC for a list of domains using Playwright.
 
-    Default is max_concurrent=1 (fully sequential) with a 2.0s delay.
-    Returns: {domain: {bias, factuality}}
+    Sequential with `delay` seconds between domains to avoid hammering the
+    server. `client` is accepted for API compatibility but not used.
+
+    Returns {domain: {bias, factuality}}.
+    Falls back to an empty dict if Playwright is unavailable.
     """
-    sem = asyncio.Semaphore(max_concurrent)
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        logger.warning(
+            "MBFC: playwright not installed — skipping MBFC scrape. "
+            "Run: pip install playwright && playwright install chromium"
+        )
+        return {}
+
     results: dict[str, dict] = {}
 
-    async def _fetch_one(client: httpx.AsyncClient, domain: str, index: int) -> None:
-        async with sem:
-            if index > 0:
-                await asyncio.sleep(delay)
-            result = await scrape_mbfc_source_async(client, domain)
-            if result:
-                results[domain] = result
-                logger.info("MBFC: %s -> %s", domain, result)
-            else:
-                logger.warning("MBFC: no result for %s", domain)
-
-    async with httpx.AsyncClient(
-        headers=_BROWSER_HEADERS,
-        follow_redirects=True,
-        timeout=20,
-    ) as client:
-        await asyncio.gather(*[
-            _fetch_one(client, domain, i)
-            for i, domain in enumerate(domains)
-        ])
+    try:
+        with sync_playwright() as pw:
+            browser, context = _make_playwright_context(pw)
+            try:
+                for i, domain in enumerate(domains):
+                    if i > 0:
+                        time.sleep(delay)
+                    result = _scrape_mbfc_domain_with_context(context, domain)
+                    if result:
+                        results[domain] = result
+                        logger.info("MBFC: %s -> %s", domain, result)
+                    else:
+                        logger.warning("MBFC: no result for %s", domain)
+            finally:
+                browser.close()
+    except Exception as exc:
+        logger.error("MBFC: Playwright session failed: %s", exc)
 
     logger.info("MBFC: scraped %d/%d domains", len(results), len(domains))
     return results
 
 
-# --- Synchronous wrappers (backwards compatibility) ---
-
-def scrape_mbfc_source(
-    client: httpx.Client,
-    domain: str,
-) -> Optional[dict]:
-    """Synchronous wrapper — delegates to scrape_mbfc_bulk_async."""
-    return asyncio.run(scrape_mbfc_bulk_async([domain])).get(domain)
+# Synchronous wrapper kept for any callers that used the old async path.
+def scrape_mbfc_source(client: httpx.Client, domain: str) -> Optional[dict]:
+    """Scrape MBFC for a single domain. Convenience wrapper around scrape_mbfc_bulk."""
+    return scrape_mbfc_bulk(client, [domain]).get(domain)
 
 
-def scrape_mbfc_bulk(
-    client: httpx.Client,
-    domains: list[str],
-    delay: float = 2.0,
-) -> dict[str, dict]:
-    """Synchronous wrapper — delegates to scrape_mbfc_bulk_async.
+# ---------------------------------------------------------------------------
+# Combined scraper — single browser session for both sources
+# ---------------------------------------------------------------------------
 
-    `client` is accepted for API compatibility but ignored;
-    the async version manages its own client internally.
+def scrape_all(client: httpx.Client, domains: list[str], delay: float = 1.5) -> tuple[dict[str, str], dict[str, dict]]:
+    """Scrape AllSides and MBFC in a single shared Playwright browser session.
+
+    More efficient than calling scrape_allsides() + scrape_mbfc_bulk() separately
+    because only one Chromium instance is launched.
+
+    Returns: (allsides_ratings, mbfc_ratings)
     """
-    return asyncio.run(scrape_mbfc_bulk_async(domains, delay=delay))
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        logger.warning(
+            "playwright not installed — using AllSides static fallback, skipping MBFC. "
+            "Run: pip install playwright && playwright install chromium"
+        )
+        return dict(_ALLSIDES_STATIC), {}
+
+    allsides_result: dict[str, str] = {}
+    mbfc_result: dict[str, dict] = {}
+
+    try:
+        with sync_playwright() as pw:
+            browser, context = _make_playwright_context(pw)
+            try:
+                # AllSides first
+                logger.info("Scraping AllSides via Playwright...")
+                allsides_result = _scrape_allsides_with_context(context)
+
+                # MBFC sequentially
+                logger.info("Scraping MBFC for %d domains (%.1fs delay)...", len(domains), delay)
+                for i, domain in enumerate(domains):
+                    if i > 0:
+                        time.sleep(delay)
+                    result = _scrape_mbfc_domain_with_context(context, domain)
+                    if result:
+                        mbfc_result[domain] = result
+                        logger.info("MBFC: %s -> %s", domain, result)
+                    else:
+                        logger.warning("MBFC: no result for %s", domain)
+            finally:
+                browser.close()
+    except Exception as exc:
+        logger.error("scrape_all: Playwright session failed: %s", exc)
+        if not allsides_result:
+            allsides_result = dict(_ALLSIDES_STATIC)
+
+    logger.info("MBFC: scraped %d/%d domains", len(mbfc_result), len(domains))
+    return allsides_result, mbfc_result
 
 
 # ---------------------------------------------------------------------------

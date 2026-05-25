@@ -4,11 +4,14 @@ Usage (manual):  python -m bias.refresh
 Usage (cron):    0 4 * * 1 /path/to/venv/bin/python -m bias.refresh
 
 What it does:
-  1. Scrapes AllSides media bias ratings page
-  2. Scrapes MBFC detail pages for all known domains
-  3. Writes the merged result to config/bias_ratings_cache.json
-  4. The BiasResolver loads from this cache on startup (if present)
+  1. Scrapes AllSides media bias ratings page via Playwright
+  2. Scrapes MBFC detail pages for all known domains via Playwright
+  3. Both sources share a single Chromium browser session (one launch)
+  4. Writes the merged result to config/bias_ratings_cache.json
+  5. The BiasResolver loads from this cache on startup (if present)
      instead of re-scraping every time the bot runs.
+
+Estimated runtime: ~60–90s for 17 domains at 1.5s inter-page delay.
 """
 
 from __future__ import annotations
@@ -24,8 +27,7 @@ import httpx
 
 from bias.source_ratings import (
     _BROWSER_HEADERS,
-    scrape_allsides,
-    scrape_mbfc_bulk,
+    scrape_all,
 )
 from bias.resolver import _FALLBACK_RATINGS, _merge_bias, _normalize_domain
 
@@ -40,29 +42,20 @@ CACHE_PATH = Path("config/bias_ratings_cache.json")
 
 def build_cache() -> dict:
     """Scrape all sources and return a serializable ratings dict."""
-    # Full browser header set — AllSides checks Sec-Fetch-* beyond just UA.
-    # Note: scrape_mbfc_bulk delegates to the async path which builds its own
-    # AsyncClient internally; this client is only used for AllSides.
-    client = httpx.Client(
-        timeout=20,
-        headers=_BROWSER_HEADERS,
-        follow_redirects=True,
-    )
-    try:
-        logger.info("Scraping AllSides...")
-        allsides = scrape_allsides(client)
+    # httpx client retained for API compatibility — scrape_all() uses Playwright.
+    client = httpx.Client(timeout=20, headers=_BROWSER_HEADERS, follow_redirects=True)
 
-        known_domains = list(
-            set(list(allsides.keys()) + list(_FALLBACK_RATINGS.keys()))
-        )
-        logger.info("Scraping MBFC for %d domains (sequential, 2s delay)...", len(known_domains))
-        # Sequential (max_concurrent=1) with 2s delay — safe for a weekly cron
-        mbfc = scrape_mbfc_bulk(client, known_domains, delay=2.0)
+    known_domains = list(_FALLBACK_RATINGS.keys())
+
+    try:
+        # Single Playwright browser session for both AllSides and MBFC.
+        allsides, mbfc = scrape_all(client, known_domains, delay=1.5)
     finally:
         client.close()
 
     merged: dict[str, dict] = {}
-    for domain in set(list(allsides.keys()) + list(mbfc.keys()) + list(_FALLBACK_RATINGS.keys())):
+    all_domains = set(list(allsides.keys()) + list(mbfc.keys()) + list(_FALLBACK_RATINGS.keys()))
+    for domain in all_domains:
         domain = _normalize_domain(domain)
         as_bias = allsides.get(domain)
         mb_data = mbfc.get(domain, {})
