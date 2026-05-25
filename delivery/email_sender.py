@@ -14,6 +14,11 @@ Resend's Python SDK has two incompatible call signatures across versions:
 
 We use the plain dict form because it works on both old and new SDK versions.
 The key must be "from" (not "from_") in the dict.
+
+Return type compatibility
+-------------------------
+resend.Emails.send() returns a dict in v0/v1 and a SendEmail object in v2+.
+_get_email_id() handles both by checking isinstance before attribute access.
 """
 
 from __future__ import annotations
@@ -21,7 +26,7 @@ from __future__ import annotations
 import logging
 import os
 from datetime import datetime
-from typing import Literal
+from typing import Any, Literal
 
 import resend
 
@@ -35,10 +40,23 @@ DigestPeriod = Literal["morning", "evening"]
 def _format_date(dt: datetime) -> str:
     """Return a date string like 'May 22, 2026' without a leading zero on the day.
 
-    strftime's %-d (no-pad day) is Linux-only; %#d is Windows-only.
-    Stripping the leading zero from %d is portable across all platforms.
+    Uses dt.day (a plain int) to avoid the fragile .replace(' 0', ' ') hack
+    which could corrupt year strings like '2005' -> '2 5' in edge cases.
+    Portable across Linux, macOS, and Windows.
     """
-    return dt.strftime("%B %d, %Y").replace(" 0", " ")
+    return f"{dt.strftime('%B')} {dt.day}, {dt.year}"
+
+
+def _get_email_id(result: Any) -> str:
+    """Extract the email ID from a Resend send() result.
+
+    Handles both return types across SDK versions:
+      - v0/v1: result is a dict  -> result.get("id", "unknown")
+      - v2+:   result is a SendEmail object -> result.id
+    """
+    if isinstance(result, dict):
+        return result.get("id", "unknown")
+    return getattr(result, "id", "unknown")
 
 
 class EmailSender:
@@ -85,7 +103,7 @@ class EmailSender:
             result = resend.Emails.send(params)
             logger.info(
                 "Email sent: id=%s to=%s subject='%s'",
-                result.get("id", "unknown"), self._to_addrs, subject
+                _get_email_id(result), self._to_addrs, subject
             )
             return True
         except Exception as exc:

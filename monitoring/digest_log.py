@@ -24,8 +24,7 @@ logger = logging.getLogger(__name__)
 
 DIGEST_LOG_PATH = Path(os.getenv("NEWSBOT_DIGEST_LOG", "logs/digest_runs.jsonl"))
 
-
-@dataclass_like := None  # Python 3.10+ style — using plain dict for stdlib compat
+# Uses a plain dict instead of a dataclass for stdlib compatibility.
 
 
 class DigestRunLogger:
