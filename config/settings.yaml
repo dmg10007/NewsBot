@@ -92,13 +92,23 @@ ingestion:
   cache_ttl_seconds: 3600
   user_agent: "NewsBot/1.0 (personal news aggregator; contact via github)"
   max_articles_per_source: 20
+  # Inter-request delay between feed fetches. Prevents IP bans and respects
+  # implicit rate limits. Increase if any source starts returning 429s.
   request_delay_seconds: 1.5
 
 deduplication:
   url_hash: true
-  # Raised from 0.92 -> 0.95 to catch more wire-syndicated near-duplicates
-  # before they enter clustering and inflate cluster count.
+  # Within-source semantic dedup threshold. Articles from the SAME outlet
+  # with headline similarity >= this value are collapsed. Raised from 0.92
+  # to 0.95 to catch more wire-syndicated near-duplicates before they enter
+  # clustering and inflate cluster count.
   headline_similarity_threshold: 0.95
+  # Cross-source wire syndication threshold. Articles from DIFFERENT outlets
+  # with similarity >= this value are treated as wire copy (AP/Reuters
+  # republication) and collapsed. Must be higher than
+  # headline_similarity_threshold to avoid collapsing legitimately similar
+  # but independently written stories. Only reduce below 0.90 with caution.
+  wire_syndication_threshold: 0.95
 
 clustering:
   model: all-MiniLM-L6-v2
@@ -140,6 +150,7 @@ bias:
   llm_fallback_model: llama3
   # Perplexity API call cap per run. After this many calls,
   # remaining clusters are routed to the local model automatically.
+  # Set skip_after_cap: true to hard-skip instead of routing to local.
   max_llm_calls_per_run: 20
   skip_after_cap: false
 
@@ -151,6 +162,9 @@ summarizer:
   request_timeout_seconds: 45
   connect_timeout_seconds: 10
   article_fetch_timeout_seconds: 15.0
+  # Importance score threshold for Brave Search enrichment. Clusters at or
+  # above this score get additional context snippets prepended to the LLM
+  # input before summarization.
   brave_enrich_threshold: 0.7
   cluster_timeout_seconds: 120
 
@@ -158,6 +172,8 @@ summarizer:
   max_concurrent_summaries: 3
   pplx_call_delay_seconds: 1.2
   pplx_max_calls_per_run: 15
+  # Clusters below this importance score skip Perplexity and go straight to
+  # the local model. Keeps API spend focused on high-value stories.
   pplx_min_importance_score: 0.3
   pplx_retry_attempts: 3
   pplx_retry_base_delay: 2.0
@@ -188,6 +204,8 @@ delivery:
     max_stories_per_category: 7
     subject_morning: "NewsBot Morning Briefing - {date}"
     subject_evening: "NewsBot Evening Briefing - {date}"
+    # HTML inline style colors for bias-lean tags in the email digest.
+    # Configurable here so colour changes don't require touching Python.
     bias_tag_colors:
       left:         "#1565c0"
       center-left:  "#1976d2"

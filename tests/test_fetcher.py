@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 from datetime import datetime, timezone
 from unittest.mock import MagicMock, patch
 
@@ -36,9 +37,34 @@ SAMPLE_SOURCE = {
     "url": "https://example.com/feed.xml",
     "bias_lean": "center",
     "credibility": "high",
-    "topics": ["politics"],
     "region": "national",
 }
+
+
+def _make_raw_article(
+    url: str = "https://example.com/story",
+    headline: str = "Test Headline",
+    source_name: str = "Test Source",
+    bias_lean: str = "center",
+) -> RawArticle:
+    """Construct a valid RawArticle for use in tests.
+
+    Centralises all required fields so individual tests only specify
+    what they actually care about.
+    """
+    return RawArticle(
+        url=url,
+        headline=headline,
+        summary="A test summary.",
+        source_name=source_name,
+        source_url="https://example.com/feed.xml",
+        url_hash=hashlib.sha256(url.encode()).hexdigest(),
+        bias_lean=bias_lean,
+        credibility="high",
+        tags=[],
+        region="national",
+        published_at=None,
+    )
 
 
 @patch("feedparser.parse")
@@ -57,6 +83,7 @@ def test_fetch_all_returns_articles(mock_parse):
 
     mock_feed = MagicMock()
     mock_feed.entries = [mock_entry_1, mock_entry_2]
+    mock_feed.bozo = False
     mock_parse.return_value = mock_feed
 
     fetcher = FeedFetcher()
@@ -81,6 +108,7 @@ def test_fetch_skips_entries_without_url(mock_parse):
 
     mock_feed = MagicMock()
     mock_feed.entries = [mock_entry]
+    mock_feed.bozo = False
     mock_parse.return_value = mock_feed
 
     fetcher = FeedFetcher()
@@ -99,28 +127,19 @@ def test_fetch_handles_source_error_gracefully(mock_parse):
 
 
 def test_raw_article_url_hash_is_deterministic():
-    article = RawArticle(
-        url="https://example.com/story",
-        headline="Headline",
-        summary="Summary",
-        source_name="Source",
-        bias_lean="center",
-        credibility="high",
-        topics=["politics"],
-        region="national",
-        published_at=None,
-    )
-    assert len(article.url_hash) == 16
-    # Same URL always produces same hash
-    article2 = RawArticle(
-        url="https://example.com/story",
-        headline="Different Headline",
-        summary="",
-        source_name="Other Source",
-        bias_lean="right",
-        credibility="medium",
-        topics=[],
-        region="national",
-        published_at=None,
-    )
+    url = "https://example.com/story"
+    article = _make_raw_article(url=url)
+
+    # url_hash is the full SHA-256 hex digest: 64 hex characters
+    assert len(article.url_hash) == 64
+    assert article.url_hash == hashlib.sha256(url.encode()).hexdigest()
+
+    # Same URL always produces the same hash regardless of other fields
+    article2 = _make_raw_article(url=url, headline="Different Headline", source_name="Other Source")
     assert article.url_hash == article2.url_hash
+
+
+def test_raw_article_different_urls_produce_different_hashes():
+    a1 = _make_raw_article(url="https://example.com/story-1")
+    a2 = _make_raw_article(url="https://example.com/story-2")
+    assert a1.url_hash != a2.url_hash

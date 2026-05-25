@@ -1,0 +1,75 @@
+# pyproject.toml — project metadata and tool configuration for NewsBot
+#
+# Tools configured here:
+#   pytest  — test runner
+#   mypy    — static type checker (baseline; tighten per-module as needed)
+#   ruff    — linter + formatter
+#
+# Dev dependencies (not in requirements.txt for production):
+#   pip install pip-tools pytest mypy ruff
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.backends.legacy:build"
+
+[project]
+name = "newsbot"
+version = "0.0.2"
+description = "Bias-free multi-source news aggregation and digest bot"
+requires-python = ">=3.11"
+readme = "README.md"
+license = { text = "MIT" }
+
+# ---------------------------------------------------------------------------
+# pytest
+# ---------------------------------------------------------------------------
+[tool.pytest.ini_options]
+# testpaths: where pytest looks for tests
+testpaths = ["tests"]
+# pythonpath: adds the repo root to sys.path so `from ingestion.fetcher import ...`
+# works without installing the package or setting PYTHONPATH manually.
+pythonpath = ["."]
+# -v: verbose output  --tb=short: compact tracebacks
+addopts = "-v --tb=short"
+# Treat unraisable exceptions (e.g. from background threads) as errors
+filterwarnings = ["error::pytest.PytestUnraisableExceptionWarning"]
+
+# ---------------------------------------------------------------------------
+# mypy
+# ---------------------------------------------------------------------------
+[tool.mypy]
+python_version = "3.11"
+# Baseline: not strict. Enable per-module as type coverage improves.
+strict = false
+ignore_missing_imports = true
+warn_unused_ignores = true
+warn_return_any = false
+# Modules with full annotations can opt into strict checking:
+# [[tool.mypy.overrides]]
+# module = "ingestion.fetcher"
+# strict = true
+
+# ---------------------------------------------------------------------------
+# ruff  (linter + formatter, replaces flake8 + isort + black)
+# ---------------------------------------------------------------------------
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+
+[tool.ruff.lint]
+# E/W: pycodestyle   F: pyflakes   I: isort   UP: pyupgrade   B: flake8-bugbear
+select = ["E", "F", "I", "UP", "B"]
+ignore = [
+    "E501",   # line too long — handled by formatter, not enforced as error
+    "B008",   # do not perform function calls in default arguments
+    "UP007",  # use X | Y instead of Optional[X] — keep Optional for clarity
+]
+
+[tool.ruff.lint.isort]
+known-first-party = ["bias", "clustering", "config", "delivery", "ingestion",
+                     "monitoring", "parsing", "scheduler", "scoring",
+                     "summarizer", "utils"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
