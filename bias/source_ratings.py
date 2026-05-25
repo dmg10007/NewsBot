@@ -1,14 +1,9 @@
 """Scrapers for AllSides and Media Bias Fact Check source ratings.
 
 Builds a normalized lookup table: domain -> {bias_lean, factuality, confidence}.
-Designed to be called once at startup (or weekly via cron) and cached in memory.
+Designed to be called once at startup (or weekly via cron) and cached to disk.
 
-Both AllSides and MBFC use Playwright headless Chromium. Cloudflare bot
-detection blocks plain httpx requests; a real browser passes TLS fingerprinting
-and JS challenge checks.
-
-A single Playwright browser instance is shared across all scraping in one
-refresh run. Use scrape_all() to get both sources in one browser session.
+Both AllSides and MBFC use Playwright headless Chromium.
 
 Install:
     pip install playwright
@@ -16,15 +11,8 @@ Install:
 
 Fallback behaviour
 ------------------
-If Playwright is not installed or Chromium fails to launch:
-  - AllSides  -> _ALLSIDES_STATIC  (hardcoded May 2026 ratings)
-  - MBFC      -> empty dict  (resolver falls back to _FALLBACK_RATINGS)
-
-MBFC crawl posture
-------------------
-MBFC is a small WordPress site behind Cloudflare. Pages are loaded
-sequentially with a configurable delay (default 1.5s). Each domain
-requires 2 page loads: search page + detail page.
+  AllSides  -> _ALLSIDES_STATIC  (hardcoded May 2026 ratings)
+  MBFC      -> empty dict  (resolver falls back to _FALLBACK_RATINGS)
 """
 
 from __future__ import annotations
@@ -62,7 +50,6 @@ MBFC_MATCH_THRESHOLD = 0.85
 
 @dataclass
 class SourceRating:
-    """Merged bias + factuality rating for a single news domain."""
     domain: str
     bias_lean: str
     factuality: str
@@ -119,26 +106,18 @@ def _make_playwright_context(pw):
 # ---------------------------------------------------------------------------
 # AllSides scraper
 # ---------------------------------------------------------------------------
-# AllSides redesigned to Tailwind in 2025. The ratings table now uses
-# class="w-full" and bias is expressed via CSS classes on a child element:
-#   color-left, color-center-left, color-center, color-center-right, color-right
-# There is no longer an <img alt="..."> carrying the bias label.
+# The Tailwind redesign (2025) no longer uses CSS classes to encode bias.
+# The bias label is rendered as plain visible text in the third <td>, e.g.:
+#   "Left", "Lean Left", "Center", "Lean Right", "Right"
+# We extract that text directly.
 
-_ALLSIDES_CLASS_MAP: dict[str, str] = {
-    "color-left":         "left",
-    "color-center-left":  "center-left",
-    "color-center":       "center",
-    "color-center-right": "center-right",
-    "color-right":        "right",
-}
-
-# Also handle legacy img alt text in case AllSides rolls back.
-_ALLSIDES_ALT_MAP: dict[str, str] = {
-    "left":                "left",
-    "lean left":           "center-left",
-    "center":              "center",
-    "lean right":          "center-right",
-    "right":               "right",
+_ALLSIDES_TEXT_MAP: dict[str, str] = {
+    "left":        "left",
+    "lean left":   "center-left",
+    "center":      "center",
+    "lean right":  "center-right",
+    "right":       "right",
+    # legacy img-alt labels kept as fallback
     "allsides lean left":  "center-left",
     "allsides lean right": "center-right",
     "allsides left":       "left",
@@ -146,71 +125,86 @@ _ALLSIDES_ALT_MAP: dict[str, str] = {
     "allsides center":     "center",
 }
 
+# Words that appear in the bias cell but are NOT the bias label.
+_ALLSIDES_NOISE = frozenset({
+    "agree", "disagree", "allsides", "bias", "rating",
+    "news", "media", "source", "type",
+})
+
+
+def _extract_allsides_bias(bias_cell) -> Optional[str]:
+    """Extract normalized bias from the third <td> of an AllSides row.
+
+    Strategy 1: color-* CSS class on any descendant (future-proof).
+    Strategy 2: visible plain text in the cell.
+    Strategy 3: img alt text.
+    Strategy 4: aria-label.
+    """
+    _CLASS_MAP = {
+        "color-left":         "left",
+        "color-center-left":  "center-left",
+        "color-center":       "center",
+        "color-center-right": "center-right",
+        "color-right":        "right",
+    }
+
+    # Strategy 1: color-* class
+    for tag in bias_cell.find_all(True):
+        for cls in tag.get("class", []):
+            if cls in _CLASS_MAP:
+                return _CLASS_MAP[cls]
+
+    # Strategy 2: plain text — strip noise words, match what remains
+    raw = bias_cell.get_text(separator=" ", strip=True).lower()
+    # Remove parenthesised notes like "(agree/disagree)"
+    raw = re.sub(r"\([^)]*\)", "", raw).strip()
+    for noise in _ALLSIDES_NOISE:
+        raw = re.sub(rf"\b{re.escape(noise)}\b", "", raw)
+    raw = " ".join(raw.split())  # collapse whitespace
+    if raw in _ALLSIDES_TEXT_MAP:
+        return _ALLSIDES_TEXT_MAP[raw]
+
+    # Strategy 3: img alt
+    img = bias_cell.find("img")
+    if img and img.get("alt"):
+        return _ALLSIDES_TEXT_MAP.get(img["alt"].strip().lower())
+
+    # Strategy 4: aria-label
+    for tag in bias_cell.find_all(True):
+        label = (tag.get("aria-label") or "").strip().lower()
+        if label in _ALLSIDES_TEXT_MAP:
+            return _ALLSIDES_TEXT_MAP[label]
+
+    return None
+
 
 def _parse_allsides_html(html: str) -> dict[str, str]:
-    """Parse the AllSides ratings table from raw HTML.
-
-    Supports both the Tailwind redesign (color-* CSS classes) and the legacy
-    table layout (img alt text).
-    """
     ratings: dict[str, str] = {}
     soup = BeautifulSoup(html, "lxml")
 
-    # Tailwind redesign: <table class="w-full">
     table = soup.find("table", {"class": lambda c: c and "w-full" in c})
-    # Legacy fallback
     if not table:
         table = soup.find("table", {"class": re.compile(r"views-table")})
     if not table:
-        logger.warning("AllSides: could not find ratings table — page structure may have changed")
+        logger.warning("AllSides: could not find ratings table")
         return ratings
 
     for row in table.find_all("tr"):
         cells = row.find_all("td")
         if len(cells) < 3:
             continue
-
-        # --- Determine domain ---
         domain = _extract_domain_allsides(cells[0])
         if not domain:
             continue
-
-        # --- Determine bias ---
-        bias_cell = cells[2]
-        normalized: Optional[str] = None
-
-        # Strategy 1: color-* CSS class on any descendant
-        for tag in bias_cell.find_all(True):
-            for cls in tag.get("class", []):
-                if cls in _ALLSIDES_CLASS_MAP:
-                    normalized = _ALLSIDES_CLASS_MAP[cls]
-                    break
-            if normalized:
-                break
-
-        # Strategy 2: img alt text (legacy)
-        if not normalized:
-            img = bias_cell.find("img")
-            if img and img.get("alt"):
-                normalized = _ALLSIDES_ALT_MAP.get(img["alt"].strip().lower())
-
-        # Strategy 3: aria-label on any element
-        if not normalized:
-            for tag in bias_cell.find_all(True):
-                label = (tag.get("aria-label") or "").strip().lower()
-                if label in _ALLSIDES_ALT_MAP:
-                    normalized = _ALLSIDES_ALT_MAP[label]
-                    break
-
-        if normalized:
-            ratings[domain] = normalized
+        bias = _extract_allsides_bias(cells[2])
+        if bias:
+            ratings[domain] = bias
 
     logger.info("AllSides: scraped %d source ratings", len(ratings))
     return ratings
 
 
 def _extract_domain_allsides(name_cell) -> Optional[str]:
-    """Extract a domain from the name cell (first <td> in a row)."""
     for a in name_cell.find_all("a", href=True):
         href = a["href"]
         if href.startswith("http"):
@@ -230,11 +224,10 @@ def _scrape_allsides_with_context(context) -> dict[str, str]:
     try:
         page = context.new_page()
         page.goto(url, wait_until="networkidle", timeout=30_000)
-        # Wait for the table itself to be present in the DOM
         try:
             page.wait_for_selector("table", timeout=10_000)
         except PWTimeout:
-            logger.warning("AllSides: table not found in DOM after networkidle")
+            logger.warning("AllSides: table not found after networkidle")
         html = page.content()
         page.close()
     except PWTimeout:
@@ -252,7 +245,6 @@ def _scrape_allsides_with_context(context) -> dict[str, str]:
 
 
 def scrape_allsides(client: httpx.Client) -> dict[str, str]:
-    """Scrape AllSides ratings via Playwright. `client` not used (compat only)."""
     try:
         from playwright.sync_api import sync_playwright
     except ImportError:
@@ -324,24 +316,84 @@ _MBFC_SEARCH_MAP: dict[str, str] = {
 # ---------------------------------------------------------------------------
 # MBFC scraper
 # ---------------------------------------------------------------------------
-# MBFC sits behind Cloudflare. The challenge is a JS redirect that resolves
-# after a brief delay. Using wait_until="networkidle" alone is not enough
-# because Cloudflare fires networkidle *before* the redirect completes.
-# The fix: wait_until="networkidle" + wait_for_selector on a real content
-# element (article or h1 that is NOT the Cloudflare challenge heading).
+# Profile URLs changed structure: previously /slug/, now /bias-category/slug/
+# e.g.  https://mediabiasfactcheck.com/left/cnn-bias/
+# We detect profiles by excluding known nav/utility path prefixes.
+
+# Slugs that are navigation or utility pages, not source profiles.
+_MBFC_NAV_SLUGS = frozenset({
+    "membership-account", "gift-memberships", "support-media-bias-fact-check",
+    "filtered-search", "mbfcs-data-api", "login", "about", "funding",
+    "methodology", "corrections-policy", "changes-corrections", "news",
+    "category", "search", "fact-check-search", "country-profiles",
+    "world-leaders-facts-and-bias", "united-states-governors-bias-ratings",
+    "united-states-senators-facts-and-bias-ratings", "journalist-bias",
+    "educational-class-materials-by-media-bias-fact-check",
+    "educational-media-sources", "interactive-maps-and-charts-by-mbfc",
+    "interactive-political-orientation-map-of-the-world",
+    "interactive-country-freedom-map-of-the-world",
+    "trump-administration-performance-tracker-chart",
+    "electoral-college-map-2024-biden-vs-trump", "re-evaluated-sources",
+    "appsextensions", "sources-pending", "submit-source",
+    "pseudoscience-dictionary", "membership-questions",
+    "mbfc-ratings-by-the-numbers", "election-center-2024",
+    "media-categories", "wp-login.php", "page",
+    # bias category index pages (not individual profiles)
+    "center", "leftcenter", "left", "right-center", "right",
+    "fake-news", "conspiracy", "pro-science", "satire",
+})
+
+
+def _is_mbfc_profile_url(url: str) -> bool:
+    """Return True if url looks like an MBFC source profile page.
+
+    Valid forms (as of May 2026):
+        https://mediabiasfactcheck.com/slug/
+        https://mediabiasfactcheck.com/bias-category/slug/
+
+    Rejected: nav pages, category indexes, date-based posts, fact-checks,
+    journalist profiles, login pages, pagination.
+    """
+    if "mediabiasfactcheck.com" not in url:
+        return False
+    # Strip scheme + domain
+    path = re.sub(r"https?://mediabiasfactcheck\.com", "", url).strip("/")
+    if not path:
+        return False
+    parts = [p for p in path.split("/") if p]
+    # Must be 1 or 2 path segments
+    if len(parts) not in (1, 2):
+        return False
+    # Reject known nav slugs
+    if parts[0] in _MBFC_NAV_SLUGS:
+        return False
+    # Reject date-based URLs (/2026/05/...)
+    if re.match(r"^\d{4}$", parts[0]):
+        return False
+    # Reject fact-check posts
+    if parts[0].startswith("fact-check-"):
+        return False
+    # Reject journalist profiles
+    if parts[-1].endswith("-bias-rating"):
+        return False
+    # Reject query strings
+    if "?" in url:
+        return False
+    return True
+
 
 _MBFC_BIAS_MAP: dict[str, str] = {
-    "left":                      "left",
-    "left-center":               "center-left",
-    "least biased":              "center",
-    "right-center":              "center-right",
-    "right":                     "right",
-    "extreme left":              "left",
-    "extreme right":             "right",
-    "conspiracy-pseudoscience":  "right",
-    "questionable":              "right",
-    "pro-science":               "center",
-    "satire":                    "center",
+    "left":                     "left",
+    "left-center":              "center-left",
+    "least biased":             "center",
+    "right-center":             "center-right",
+    "right":                    "right",
+    "extreme left":             "left",
+    "extreme right":            "right",
+    "conspiracy-pseudoscience": "right",
+    "questionable":             "right",
+    "pro-science":              "center",
+    "satire":                   "center",
 }
 
 _MBFC_FACTUALITY_MAP: dict[str, str] = {
@@ -353,36 +405,16 @@ _MBFC_FACTUALITY_MAP: dict[str, str] = {
     "very low":       "very-low",
 }
 
-_MBFC_PROFILE_RE = re.compile(
-    r"https?://mediabiasfactcheck\.com/[^/]+/?$"
-)
-
-
-def _is_mbfc_profile_url(url: str) -> bool:
-    return bool(_MBFC_PROFILE_RE.match(url)) and not url.rstrip("/").endswith("mediabiasfactcheck.com")
-
 
 def _wait_past_cloudflare(page, timeout_ms: int = 15_000) -> None:
-    """Block until real page content is in the DOM (not the CF challenge).
-
-    Cloudflare's 'Checking your browser' page renders an <h1> whose text
-    starts with 'Checking'. We poll until either:
-      - The h1 text changes away from the CF challenge, OR
-      - A known content selector appears, OR
-      - The timeout expires (we proceed anyway and let the parser handle it).
-    """
     from playwright.sync_api import TimeoutError as PWTimeout
     try:
-        # Wait for any <article> or a search results heading to appear
         page.wait_for_selector("article, .search-results, .entry-title", timeout=timeout_ms)
     except PWTimeout:
-        # If we time out waiting for content, log and carry on — the parser
-        # will log a warning if the HTML is still the CF challenge.
         logger.debug("_wait_past_cloudflare: content selector not found within %dms", timeout_ms)
 
 
 def _scrape_mbfc_domain_with_context(context, domain: str) -> Optional[dict]:
-    """Scrape MBFC for a single domain using an existing Playwright context."""
     from playwright.sync_api import TimeoutError as PWTimeout
 
     search_term = _MBFC_SEARCH_MAP.get(domain, domain.split(".")[0])
@@ -402,15 +434,12 @@ def _scrape_mbfc_domain_with_context(context, domain: str) -> Optional[dict]:
         logger.debug("MBFC: search page failed for %s: %s", domain, exc)
         return None
 
-    # Detect if we're still on the CF challenge page
     if "Checking your browser" in search_html and "<article" not in search_html:
         logger.warning("MBFC: Cloudflare challenge not resolved for %s", domain)
         return None
 
     soup = BeautifulSoup(search_html, "lxml")
     detail_url: Optional[str] = None
-
-    # Broad link scan: any href that looks like an MBFC profile page
     for a in soup.find_all("a", href=True):
         href = a["href"]
         if _is_mbfc_profile_url(href):
@@ -424,8 +453,8 @@ def _scrape_mbfc_domain_with_context(context, domain: str) -> Optional[dict]:
     # --- Detail page ---
     try:
         page = context.new_page()
-        page.goto(detail_url, wait_until="networkidle", timeout=25_000)
-        _wait_past_cloudflare(page)
+        page.goto(detail_url, wait_until="domcontentloaded", timeout=25_000)
+        # Detail pages load fast; domcontentloaded is enough
         detail_html = page.content()
         page.close()
     except PWTimeout:
@@ -443,7 +472,6 @@ def scrape_mbfc_bulk(
     domains: list[str],
     delay: float = 1.5,
 ) -> dict[str, dict]:
-    """Scrape MBFC for a list of domains via Playwright. `client` not used (compat)."""
     try:
         from playwright.sync_api import sync_playwright
     except ImportError:
@@ -478,7 +506,7 @@ def scrape_mbfc_source(client: httpx.Client, domain: str) -> Optional[dict]:
 
 
 # ---------------------------------------------------------------------------
-# Combined scraper — single browser session
+# Combined scraper
 # ---------------------------------------------------------------------------
 
 def scrape_all(
@@ -486,7 +514,6 @@ def scrape_all(
     domains: list[str],
     delay: float = 1.5,
 ) -> tuple[dict[str, str], dict[str, dict]]:
-    """Scrape AllSides + MBFC in one shared Playwright browser session."""
     try:
         from playwright.sync_api import sync_playwright
     except ImportError:
@@ -525,65 +552,39 @@ def scrape_all(
 
 
 # ---------------------------------------------------------------------------
-# MBFC detail page parser
+# MBFC detail parser
 # ---------------------------------------------------------------------------
 
 def _parse_mbfc_detail(soup: BeautifulSoup, domain: str = "") -> Optional[dict]:
-    """Extract bias and factuality from an MBFC detail page.
-
-    MBFC profile pages embed ratings in a paragraph like:
-        Bias Rating: LEFT-CENTER
-        Factual Reporting: HIGH
-    The exact capitalisation and surrounding whitespace vary; we match
-    case-insensitively and strip punctuation/asterisks.
-    """
     bias: Optional[str] = None
     factuality: Optional[str] = None
 
     full_text = soup.get_text(separator="\n", strip=True)
 
-    # Strategy 1: look for labeled lines in the full text
     for line in full_text.splitlines():
-        line_lower = line.strip().lower()
-
-        if not bias and re.search(r"bias\s+rating", line_lower):
-            m = re.search(
-                r"bias\s+rating\s*[:\-]\s*(.+)",
-                line_lower,
-            )
+        ll = line.strip().lower()
+        if not bias and re.search(r"bias\s+rating", ll):
+            m = re.search(r"bias\s+rating\s*[:\-]\s*(.+)", ll)
             if m:
-                raw = m.group(1).strip().strip("*").strip()
-                bias = _MBFC_BIAS_MAP.get(raw)
-
-        if not factuality and re.search(r"factual\s+reporting", line_lower):
-            m = re.search(
-                r"factual\s+reporting\s*[:\-]\s*(.+)",
-                line_lower,
-            )
+                bias = _MBFC_BIAS_MAP.get(m.group(1).strip().strip("*"))
+        if not factuality and re.search(r"factual\s+reporting", ll):
+            m = re.search(r"factual\s+reporting\s*[:\-]\s*(.+)", ll)
             if m:
-                raw = m.group(1).strip().strip("*").strip()
-                factuality = _MBFC_FACTUALITY_MAP.get(raw)
-
+                factuality = _MBFC_FACTUALITY_MAP.get(m.group(1).strip().strip("*"))
         if bias and factuality:
             break
 
-    # Strategy 2: scan <p> and <div> tags for labeled text blocks
     if not bias or not factuality:
         for tag in soup.find_all(["p", "td", "li", "div"]):
             text = tag.get_text(separator=" ", strip=True).lower()
-
             if not bias:
                 m = re.search(r"bias\s+rating\s*[:\-]\s*([a-z][a-z\s\-]+)", text)
                 if m:
-                    raw = m.group(1).strip().strip("*")
-                    bias = _MBFC_BIAS_MAP.get(raw)
-
+                    bias = _MBFC_BIAS_MAP.get(m.group(1).strip().strip("*"))
             if not factuality:
                 m = re.search(r"factual\s+reporting\s*[:\-]\s*([a-z][a-z\s]+)", text)
                 if m:
-                    raw = m.group(1).strip().strip("*")
-                    factuality = _MBFC_FACTUALITY_MAP.get(raw)
-
+                    factuality = _MBFC_FACTUALITY_MAP.get(m.group(1).strip().strip("*"))
             if bias and factuality:
                 break
 
