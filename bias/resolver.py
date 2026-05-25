@@ -4,7 +4,7 @@ Usage
 -----
     from bias.resolver import BiasResolver
 
-    resolver = BiasResolver()          # scrapes at init (async internally)
+    resolver = BiasResolver()          # scrapes at init
     rating = resolver.resolve("foxnews.com")
     print(rating.bias_lean)            # 'right'
     print(rating.factuality)           # 'mixed'
@@ -15,19 +15,13 @@ The resolver merges AllSides + MBFC ratings:
   - Differ by 1 scale step: confidence = 0.67, use AllSides
   - Differ by 2+ steps:     confidence = 0.33, flag in notes
 
-Async refresh
--------------
-refresh_async() runs AllSides (in a thread, single request) and
-MBFC (async, concurrent) simultaneously via asyncio.gather, cutting
-startup time from 90s+ down to ~10s for a 30-domain list.
-
-The synchronous refresh() wrapper is kept so existing call sites
-(tests, CLI) continue to work without modification.
+Both AllSides and MBFC now use Playwright headless Chromium via scrape_all().
+A single browser session handles both sources. refresh() runs the scrape in a
+background thread so it doesn't block an async event loop if one is running.
 """
 
 from __future__ import annotations
 
-import asyncio
 import logging
 import re
 import threading
@@ -39,9 +33,9 @@ from bias.source_ratings import (
     BIAS_SCALE,
     FACTUALITY_SCALE,
     SourceRating,
+    _BROWSER_HEADERS,
     _OUTLET_DOMAIN_MAP,
-    scrape_allsides,
-    scrape_mbfc_bulk_async,
+    scrape_all,
 )
 
 logger = logging.getLogger(__name__)
@@ -74,7 +68,7 @@ _CREDIBILITY_TO_FACTUALITY: dict[str, str] = {
 
 
 class BiasResolver:
-    """Thread-safe bias + factuality resolver with async-backed lazy initialization."""
+    """Thread-safe bias + factuality resolver backed by Playwright scraping."""
 
     def __init__(self, auto_scrape: bool = True) -> None:
         self._lock = threading.Lock()
@@ -84,48 +78,33 @@ class BiasResolver:
         self._initialized = False
 
         if auto_scrape:
-            self.refresh()  # sync wrapper — fine at startup
+            self.refresh()
 
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
 
     def refresh(self) -> None:
-        """Synchronous refresh wrapper.
+        """Scrape AllSides and MBFC via a single Playwright browser session.
 
-        Blocks until AllSides + MBFC scraping completes.
-        Calls refresh_async() via asyncio.run().
-        Existing call sites (tests, CLI) work unchanged.
+        Blocks until complete. Safe to call from sync or async contexts —
+        the Playwright sync API manages its own event loop internally.
         """
-        asyncio.run(self.refresh_async())
-
-    async def refresh_async(self) -> None:
-        """Async refresh: AllSides (thread) + MBFC (async) run concurrently.
-
-        AllSides is a single sync HTTP request — run in a thread so it
-        doesn't block the event loop. MBFC runs natively async with up to
-        5 concurrent domain lookups.
-        """
-        logger.info("BiasResolver: refreshing source ratings (async)...")
-
-        sync_client = httpx.Client(
-            timeout=20,
-            headers={"User-Agent": "NewsBot/1.0 (bias-ratings-lookup; educational use)"},
-            follow_redirects=True,
-        )
+        logger.info("BiasResolver: refreshing source ratings...")
 
         known_domains = list(
             set(list(self._allsides.keys()) + list(_FALLBACK_RATINGS.keys()))
         ) or list(_FALLBACK_RATINGS.keys())
 
+        client = httpx.Client(
+            timeout=20,
+            headers=_BROWSER_HEADERS,
+            follow_redirects=True,
+        )
         try:
-            # Run AllSides (sync, in thread) and MBFC (async) in parallel
-            allsides_result, mbfc_result = await asyncio.gather(
-                asyncio.to_thread(scrape_allsides, sync_client),
-                scrape_mbfc_bulk_async(known_domains, delay=1.0, max_concurrent=5),
-            )
+            allsides_result, mbfc_result = scrape_all(client, known_domains, delay=1.5)
         finally:
-            sync_client.close()
+            client.close()
 
         with self._lock:
             self._allsides = allsides_result
