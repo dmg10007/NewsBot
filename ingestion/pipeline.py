@@ -22,11 +22,11 @@ sources.yaml organises each tier into two sub-keys::
       scrapers:
         - {name: ..., url: ..., scraper_class: ..., ...}
 
-FeedFetcher only handles RSS sources. Scraper sources are collected here
-and logged; full scraper execution is a planned extension.
+FeedFetcher handles RSS sources. Scraper sources are now executed here
+via SCRAPER_REGISTRY. Both paths feed into the same deduplicator.
 
-The function handles its own FeedFetcher lifecycle (open/close). Callers
-do not need to manage the fetcher directly.
+The function handles its own FeedFetcher lifecycle (open/close). Scrapers
+are also individually opened and closed within the loop.
 """
 
 from __future__ import annotations
@@ -37,6 +37,7 @@ from typing import Any
 from config.loader import get_settings
 from ingestion.deduplicator import Deduplicator
 from ingestion.fetcher import FeedFetcher, RawArticle
+from ingestion.scraper import SCRAPER_REGISTRY
 
 logger = logging.getLogger(__name__)
 
@@ -71,6 +72,9 @@ def _scraper_sources(tier_data: Any) -> list[dict]:
 def ingest_all_sources(sources: dict) -> list[RawArticle]:
     """Fetch, deduplicate, and return all raw articles across every tier.
 
+    Runs both RSS (FeedFetcher) and HTML/scraper sources (SCRAPER_REGISTRY)
+    for each tier. All articles from both paths are merged before dedup.
+
     Args:
         sources: The full sources mapping from get_sources(). Expected shape::
 
@@ -104,15 +108,30 @@ def ingest_all_sources(sources: dict) -> list[RawArticle]:
                 logger.info("Fetched %d raw articles from %s tier", len(articles), tier)
                 all_articles.extend(articles)
 
-            if scrapers:
-                # Scraper execution is not yet implemented in FeedFetcher.
-                # Sources are logged so operators know they exist and are
-                # intentionally skipped, not silently dropped.
-                names = [s.get("name", "<unnamed>") for s in scrapers]
-                logger.info(
-                    "Skipping %d scraper source(s) from %s tier (not yet implemented): %s",
-                    len(scrapers), tier, ", ".join(names),
-                )
+            for scraper_cfg in scrapers:
+                scraper_class_name = scraper_cfg.get("scraper_class", "")
+                scraper_cls = SCRAPER_REGISTRY.get(scraper_class_name)
+                if not scraper_cls:
+                    logger.warning(
+                        "Unknown scraper_class '%s' for source '%s' — skipping",
+                        scraper_class_name, scraper_cfg.get("name", "<unnamed>"),
+                    )
+                    continue
+                scraper = scraper_cls(scraper_cfg)
+                try:
+                    scraped = scraper.scrape()
+                    logger.info(
+                        "Scraped %d articles from %s (%s tier)",
+                        len(scraped), scraper_cfg.get("name", scraper_class_name), tier,
+                    )
+                    all_articles.extend(scraped)
+                except Exception as exc:
+                    logger.error(
+                        "Scraper %s failed for source '%s': %s",
+                        scraper_class_name, scraper_cfg.get("name", "<unnamed>"), exc,
+                    )
+                finally:
+                    scraper.close()
     finally:
         fetcher.close()
 

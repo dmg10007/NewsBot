@@ -4,15 +4,23 @@ Each scraper is a self-contained class that fetches and parses
 a specific outlet's public-facing pages. Add new outlets by
 subclassing BaseScraper and registering in SCRAPER_REGISTRY.
 
-Fix (May 2026): feedparser.parse() has no built-in timeout — it uses
-urllib internally and will hang indefinitely on a slow/unresponsive host.
-All RSS calls inside scrapers now pre-fetch the feed content via the
+Fix (May 2026 / Batch 4): _make_article() previously passed wrong kwargs
+to RawArticle:
+  - topics= does not exist on RawArticle (the field is tags: list[str])
+  - url_hash and source_url were omitted (both required)
+This caused TypeError on every scraper instantiation, silently dropping
+all scraper sources from every digest run.
+
+Fix (May 2026 / Batch 2): feedparser.parse() has no built-in timeout — it
+uses urllib internally and will hang indefinitely on a slow/unresponsive
+host. All RSS calls inside scrapers now pre-fetch the feed content via the
 httpx client (which has the configured timeout) and pass the raw XML
 to feedparser.parse() as a string instead of a URL.
 """
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import time
 from abc import ABC, abstractmethod
@@ -102,7 +110,20 @@ class BaseScraper(ABC):
         headline: str,
         summary: str = "",
         published_at: Optional[datetime] = None,
+        tags: Optional[list[str]] = None,
     ) -> Optional[RawArticle]:
+        """Build a RawArticle from scraped fields.
+
+        Args:
+            url:          Canonical article URL.
+            headline:     Article headline text.
+            summary:      Short summary or excerpt (optional).
+            published_at: Publication datetime (optional).
+            tags:         List of topic/category tag strings (optional).
+
+        Returns:
+            RawArticle, or None if url or headline is empty.
+        """
         if not url or not headline:
             return None
         return RawArticle(
@@ -110,9 +131,14 @@ class BaseScraper(ABC):
             headline=headline.strip(),
             summary=summary.strip(),
             source_name=self.source["name"],
+            # source_url is the feed/scraper entry point, not the article URL
+            source_url=self.source["url"],
+            # Full SHA-256 hex digest — consistent with FeedFetcher
+            url_hash=hashlib.sha256(url.encode()).hexdigest(),
             bias_lean=self.source.get("bias_lean", "unknown"),
             credibility=self.source.get("credibility", "medium"),
-            topics=self.source.get("topics", []),
+            # RawArticle uses tags: list[str], not topics
+            tags=tags or [],
             region=self.source.get("region", "national"),
             published_at=published_at,
         )
@@ -142,7 +168,13 @@ class GenericRSSBackedScraper(BaseScraper):
             published_at = None
             if hasattr(entry, "published_parsed") and entry.published_parsed:
                 published_at = datetime(*entry.published_parsed[:6], tzinfo=timezone.utc)
-            article = self._make_article(url, headline, summary, published_at)
+            # Extract RSS <category> tags if present
+            entry_tags: list[str] = [
+                tag.get("term", "").strip()
+                for tag in getattr(entry, "tags", [])
+                if tag.get("term", "").strip()
+            ]
+            article = self._make_article(url, headline, summary, published_at, tags=entry_tags)
             if article:
                 articles.append(article)
         logger.info("Scraped %d articles from %s (RSS)", len(articles), self.source["name"])
