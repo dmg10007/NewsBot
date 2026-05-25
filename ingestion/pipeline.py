@@ -22,15 +22,13 @@ sources.yaml organises each tier into two sub-keys::
       scrapers:
         - {name: ..., url: ..., scraper_class: ..., ...}
 
-FeedFetcher handles RSS sources. Scraper sources are now executed here
-via SCRAPER_REGISTRY. Both paths feed into the same deduplicator.
+FeedFetcher handles RSS sources one at a time via fetch(source).
+Scraper sources are executed via SCRAPER_REGISTRY. Both paths feed
+into the same deduplicator.
 
 Lifecycle
 ---------
 FeedFetcher and Deduplicator are both closed in the finally block.
-Deduplicator.close() is currently a no-op but is called explicitly so
-future persistent state (e.g., a seen-URL store) can be cleaned up
-without changing this call site.
 """
 
 from __future__ import annotations
@@ -51,17 +49,12 @@ _TIERS = ("national", "state", "local")
 def _rss_sources(tier_data: Any) -> list[dict]:
     """Extract the RSS source list from a tier entry.
 
-    sources.yaml structures each tier as a dict with 'rss' and optionally
-    'scrapers' sub-keys. FeedFetcher only processes RSS sources; scraper
-    sources are handled separately.
-
     Accepts both the nested dict form (normal) and a bare list (fallback
     for simplified configs or tests that pass sources directly).
     """
     if isinstance(tier_data, dict):
         return tier_data.get("rss", [])
     if isinstance(tier_data, list):
-        # Simplified config or test fixture: treat whole list as RSS sources.
         return tier_data
     return []
 
@@ -75,9 +68,6 @@ def _scraper_sources(tier_data: Any) -> list[dict]:
 
 def ingest_all_sources(sources: dict) -> list[RawArticle]:
     """Fetch, deduplicate, and return all raw articles across every tier.
-
-    Runs both RSS (FeedFetcher) and HTML/scraper sources (SCRAPER_REGISTRY)
-    for each tier. All articles from both paths are merged before dedup.
 
     Args:
         sources: The full sources mapping from get_sources(). Expected shape::
@@ -106,10 +96,20 @@ def ingest_all_sources(sources: dict) -> list[RawArticle]:
             scrapers = _scraper_sources(tier_data)
 
             if rss:
-                logger.info("Ingesting %d RSS sources from %s tier...", len(rss), tier)
-                articles = fetcher.fetch_all(rss)
-                logger.info("Fetched %d raw articles from %s tier", len(articles), tier)
-                all_articles.extend(articles)
+                logger.info(
+                    "Ingesting %d RSS sources from %s tier...", len(rss), tier
+                )
+                tier_articles: list[RawArticle] = []
+                for source in rss:
+                    fetched = fetcher.fetch(source)
+                    logger.debug(
+                        "  %s: %d articles", source.get("name", source.get("url")), len(fetched)
+                    )
+                    tier_articles.extend(fetched)
+                logger.info(
+                    "Fetched %d raw articles from %s tier", len(tier_articles), tier
+                )
+                all_articles.extend(tier_articles)
 
             for scraper_cfg in scrapers:
                 scraper_class_name = scraper_cfg.get("scraper_class", "")
