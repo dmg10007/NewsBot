@@ -10,50 +10,54 @@
 # Fox Business moxie.foxnews.com deprecated — replaced with feeds.foxbusiness.com
 # WRAL RSS paths from official WRAL RSS page (wral.com/about/wral-rss-feeds/)
 # Charlotte Observer widget RSS dead — replaced with Google News proxy
+#
+# Geo scoping: Reuters and AP Google News proxies now include 'united states'
+# query constraint to prevent pure international wire content from filling
+# national slots. Topic-specific feeds retain their topic constraint + US scope.
 
 national:
   rss:
     - name: AP News - Top Headlines
-      url: https://news.google.com/rss/search?q=when:24h+allinurl:apnews.com&hl=en-US&gl=US&ceid=US:en
+      url: https://news.google.com/rss/search?q=when:24h+allinurl:apnews.com+"united+states"&hl=en-US&gl=US&ceid=US:en
       bias_lean: center
       credibility: high
       topics: [politics, economy, current_events]
-      note: "AP News has no public RSS; proxied via Google News allinurl filter"
+      note: "AP News has no public RSS; proxied via Google News allinurl filter + US scope"
 
     - name: AP News - Politics
-      url: https://news.google.com/rss/search?q=when:24h+allinurl:apnews.com+politics&hl=en-US&gl=US&ceid=US:en
+      url: https://news.google.com/rss/search?q=when:24h+allinurl:apnews.com+politics+"united+states"&hl=en-US&gl=US&ceid=US:en
       bias_lean: center
       credibility: high
       topics: [politics]
-      note: "Google News proxy"
+      note: "Google News proxy + US scope"
 
     - name: AP News - Economy
-      url: https://news.google.com/rss/search?q=when:24h+allinurl:apnews.com+business+economy&hl=en-US&gl=US&ceid=US:en
+      url: https://news.google.com/rss/search?q=when:24h+allinurl:apnews.com+business+economy+"united+states"&hl=en-US&gl=US&ceid=US:en
       bias_lean: center
       credibility: high
       topics: [economy]
-      note: "Google News proxy"
+      note: "Google News proxy + US scope"
 
     - name: Reuters - Top News
-      url: https://news.google.com/rss/search?q=site:reuters.com&hl=en-US&gl=US&ceid=US:en
+      url: https://news.google.com/rss/search?q=site:reuters.com+"united+states"&hl=en-US&gl=US&ceid=US:en
       bias_lean: center
       credibility: high
       topics: [politics, economy, current_events]
-      note: "Reuters dropped public RSS in 2020; proxied via Google News"
+      note: "Reuters dropped public RSS in 2020; proxied via Google News + US scope"
 
     - name: Reuters - Politics
-      url: https://news.google.com/rss/search?q=site:reuters.com+politics&hl=en-US&gl=US&ceid=US:en
+      url: https://news.google.com/rss/search?q=site:reuters.com+politics+"united+states"&hl=en-US&gl=US&ceid=US:en
       bias_lean: center
       credibility: high
       topics: [politics]
-      note: "Google News proxy"
+      note: "Google News proxy + US scope"
 
     - name: Reuters - Economy
-      url: https://news.google.com/rss/search?q=site:reuters.com+economy+business&hl=en-US&gl=US&ceid=US:en
+      url: https://news.google.com/rss/search?q=site:reuters.com+economy+business+"united+states"&hl=en-US&gl=US&ceid=US:en
       bias_lean: center
       credibility: high
       topics: [economy]
-      note: "Google News proxy"
+      note: "Google News proxy + US scope"
 
     - name: NPR News
       url: https://feeds.npr.org/1001/rss.xml

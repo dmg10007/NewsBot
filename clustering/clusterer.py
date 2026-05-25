@@ -46,6 +46,16 @@ max_age_delta_hours is now a per-tier map in settings.yaml:
       local: 24
 
 Scalar values are still accepted for backward compatibility.
+
+Tier mapping
+------------
+_tier() maps RawArticle.region values to scorer/clusterer tier strings:
+  national       -> 'national'
+  north_carolina -> 'state'
+  lee_county_nc  -> 'local'   (or any other local region)
+  international  -> 'international'  (dropped by GeoFilter before this stage;
+                                      mapping present as a safety net)
+  <anything else>-> 'local'   (unknown regions treated as local, not national)
 """
 
 from __future__ import annotations
@@ -301,9 +311,19 @@ class StoryClusterer:
 
     @staticmethod
     def _tier(region: str) -> str:
-        """Map a RawArticle.region value to a display tier string."""
+        """Map a RawArticle.region value to a display tier string.
+
+        Explicit mapping prevents unknown regions from accidentally receiving
+        the local_tier scorer boost (1.5x). Unknown regions fall to 'local'
+        which is conservative — they won't be treated as high-value national
+        content. International is mapped explicitly so future international
+        sources don't accidentally pollute the national tier.
+        """
         if region == "national":
             return "national"
         if region == "north_carolina":
             return "state"
+        if region == "international":
+            return "international"
+        # All other regions (lee_county_nc, unknown, etc.) → local
         return "local"
