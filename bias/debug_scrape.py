@@ -1,19 +1,28 @@
-"""One-shot debug script to capture raw HTML from AllSides and MBFC.
+"""Debug script: dumps raw HTML structure and all hrefs from MBFC search results.
 
 Run:  python -m bias.debug_scrape
 
 Outputs:
-    debug_allsides.html     — full AllSides ratings page HTML
-    debug_mbfc_search.html  — MBFC search results page for 'cnn'
-    debug_mbfc_detail.html  — first MBFC profile page found in search results
+    debug_allsides.html
+    debug_mbfc_search.html   (MBFC search for 'cnn')
+    debug_mbfc_detail.html   (first linked page, whatever it is)
 
-Use these to inspect the real page structure and update the CSS selectors
-in source_ratings.py accordingly.
+Key console output:
+    - AllSides table class names + bias CSS classes found
+    - Every <a href> on the MBFC search page (no filtering)
+    - Text content of every line containing 'bias' or 'factual' on MBFC detail page
 """
 
 from __future__ import annotations
-
 from pathlib import Path
+
+
+def _wait_for_content(page, timeout_ms: int = 15_000) -> None:
+    from playwright.sync_api import TimeoutError as PWTimeout
+    try:
+        page.wait_for_selector("article, .entry-title, .search-results, h2", timeout=timeout_ms)
+    except PWTimeout:
+        pass
 
 
 def main() -> None:
@@ -22,6 +31,8 @@ def main() -> None:
     except ImportError:
         print("playwright not installed. Run: pip install playwright && playwright install chromium")
         return
+
+    from bs4 import BeautifulSoup
 
     with sync_playwright() as pw:
         browser = pw.chromium.launch(headless=True)
@@ -35,89 +46,106 @@ def main() -> None:
             ),
         )
 
-        # --- AllSides ---
-        print("Loading AllSides ratings page...")
+        # ----------------------------------------------------------------
+        # AllSides
+        # ----------------------------------------------------------------
+        print("=" * 60)
+        print("ALLSIDES")
+        print("=" * 60)
         page = context.new_page()
         page.goto("https://www.allsides.com/media-bias/ratings", wait_until="networkidle", timeout=30_000)
+        page.wait_for_selector("table", timeout=10_000)
         html = page.content()
         page.close()
         Path("debug_allsides.html").write_text(html, encoding="utf-8")
-        print(f"  Saved debug_allsides.html ({len(html):,} bytes)")
+        print(f"Saved debug_allsides.html ({len(html):,} bytes)")
 
-        # Quick structural hints
-        from bs4 import BeautifulSoup
         soup = BeautifulSoup(html, "lxml")
         tables = soup.find_all("table")
-        print(f"  Tables found: {len(tables)}")
-        for t in tables[:5]:
-            print(f"    <table class='{t.get('class', [])}'>  id='{t.get('id', '')}'")
-        rows_sample = []
-        for t in tables[:3]:
-            rows_sample += t.find_all("tr")[:3]
-        if rows_sample:
-            print(f"  First row sample: {rows_sample[0]}"[:300])
+        print(f"Tables found: {len(tables)}")
+        for t in tables:
+            print(f"  class={t.get('class')}  id={t.get('id')}")
 
-        # Bias-related class names in the page
-        bias_classes = set()
-        for tag in soup.find_all(class_=True):
-            for cls in tag.get("class", []):
-                if any(k in cls.lower() for k in ("bias", "rating", "lean", "left", "right", "center")):
-                    bias_classes.add(cls)
-        print(f"  Bias-related CSS classes: {sorted(bias_classes)[:30]}")
+        # Sample first 3 data rows
+        for t in tables[:1]:
+            rows = t.find_all("tr")
+            print(f"  Row count: {len(rows)}")
+            for row in rows[1:4]:
+                cells = row.find_all("td")
+                if cells:
+                    all_classes = []
+                    for tag in row.find_all(True):
+                        all_classes += tag.get("class", [])
+                    bias_classes = [c for c in all_classes if any(
+                        k in c for k in ("color-", "bias", "left", "right", "center")
+                    )]
+                    print(f"  Row text: {row.get_text(' ', strip=True)[:80]}")
+                    print(f"    bias-related classes: {list(set(bias_classes))}")
 
-        # --- MBFC search ---
-        print("\nLoading MBFC search for 'cnn'...")
+        # ----------------------------------------------------------------
+        # MBFC search
+        # ----------------------------------------------------------------
+        print()
+        print("=" * 60)
+        print("MBFC SEARCH — 'cnn'")
+        print("=" * 60)
         page = context.new_page()
-        page.goto("https://mediabiasfactcheck.com/?s=cnn", wait_until="domcontentloaded", timeout=20_000)
+        page.goto("https://mediabiasfactcheck.com/?s=cnn", wait_until="networkidle", timeout=25_000)
+        _wait_for_content(page)
         search_html = page.content()
         page.close()
         Path("debug_mbfc_search.html").write_text(search_html, encoding="utf-8")
-        print(f"  Saved debug_mbfc_search.html ({len(search_html):,} bytes)")
+        print(f"Saved debug_mbfc_search.html ({len(search_html):,} bytes)")
 
-        # Show all <a href> links that look like profile pages
         soup2 = BeautifulSoup(search_html, "lxml")
-        profile_links = [
-            a["href"] for a in soup2.find_all("a", href=True)
-            if "mediabiasfactcheck.com/" in a.get("href", "")
-            and a["href"].count("/") >= 4
-        ]
-        print(f"  MBFC profile links found: {profile_links[:10]}")
 
-        # Show heading/title tags used in search results
-        for sel in ["h1", "h2", "h3", "h4", ".entry-title", ".post-title", ".result-title"]:
-            found = soup2.select(sel)
-            if found:
-                print(f"  Selector '{sel}': {len(found)} hits — first: {found[0].get_text(strip=True)[:80]}")
+        # Cloudflare check
+        h1s = [h.get_text(strip=True) for h in soup2.find_all("h1")]
+        print(f"H1 tags: {h1s}")
 
-        # --- MBFC detail ---
-        detail_url = next(
-            (a["href"] for a in soup2.find_all("a", href=True)
-             if "mediabiasfactcheck.com/" in a.get("href", "")
-             and a["href"].count("/") >= 4),
-            None,
-        )
+        # Print EVERY href on the page — no filtering
+        all_hrefs = [a["href"] for a in soup2.find_all("a", href=True)]
+        print(f"Total <a href> count: {len(all_hrefs)}")
+        print("All hrefs:")
+        for href in all_hrefs:
+            print(f"  {href}")
+
+        # ----------------------------------------------------------------
+        # MBFC detail — follow first mediabiasfactcheck.com link
+        # ----------------------------------------------------------------
+        import re
+        detail_url = None
+        for href in all_hrefs:
+            if "mediabiasfactcheck.com" in href and href != "https://mediabiasfactcheck.com/":
+                detail_url = href
+                break
+
         if detail_url:
-            print(f"\nLoading MBFC detail page: {detail_url}")
+            print()
+            print("=" * 60)
+            print(f"MBFC DETAIL — {detail_url}")
+            print("=" * 60)
             page = context.new_page()
-            page.goto(detail_url, wait_until="domcontentloaded", timeout=20_000)
+            page.goto(detail_url, wait_until="networkidle", timeout=25_000)
+            _wait_for_content(page)
             detail_html = page.content()
             page.close()
             Path("debug_mbfc_detail.html").write_text(detail_html, encoding="utf-8")
-            print(f"  Saved debug_mbfc_detail.html ({len(detail_html):,} bytes)")
+            print(f"Saved debug_mbfc_detail.html ({len(detail_html):,} bytes)")
 
             soup3 = BeautifulSoup(detail_html, "lxml")
             full_text = soup3.get_text(separator="\n", strip=True)
-            # Find lines containing bias/factuality keywords
-            keywords = ("bias", "factual", "rating", "left", "right", "center", "least")
+            keywords = ("bias", "factual", "rating", "reporting")
+            print("Lines containing bias/factual keywords:")
             for line in full_text.splitlines():
-                if any(k in line.lower() for k in keywords) and len(line.strip()) > 5:
-                    print(f"  TEXT MATCH: {line.strip()[:120]}")
+                if any(k in line.lower() for k in keywords) and len(line.strip()) > 3:
+                    print(f"  {line.strip()[:160]}")
         else:
-            print("\nNo MBFC detail link found in search results.")
+            print("No mediabiasfactcheck.com links found at all.")
 
         browser.close()
 
-    print("\nDone. Open debug_allsides.html / debug_mbfc_search.html / debug_mbfc_detail.html in a browser.")
+    print("\nDone.")
 
 
 if __name__ == "__main__":
