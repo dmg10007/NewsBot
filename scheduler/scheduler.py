@@ -29,10 +29,10 @@ occurs mid-run.
 
 Scoring
 -------
-score_clusters() is called between clustering (Stage 3) and bias analysis
-(Stage 4). It writes importance_score to each StoryCluster in place.
-Downstream consumers (Summarizer, LLMAnalyzer) read this value to decide
-whether to use Perplexity, Brave enrichment, or local fallback.
+score_clusters() mutates clusters in place and returns None. Call it between
+clustering (Stage 3) and bias analysis (Stage 4); do NOT reassign its return
+value. Downstream consumers (Summarizer, LLMAnalyzer) read importance_score
+to decide whether to use Perplexity, Brave enrichment, or local fallback.
 """
 
 from __future__ import annotations
@@ -139,13 +139,13 @@ def _run_digest_inner(period: str) -> None:
     clusters = clusterer.cluster(parsed)
     logger.info("Produced %d story clusters", len(clusters))
 
-    # Stage 3b: Score clusters
+    # Stage 3b: Score clusters (mutates in place, returns None)
     # Must run before any downstream consumer checks importance_score.
-    # Fixes three silent cascade failures (H-01):
-    #   - Singleton filter in clusterer uses 0.0 score without this → drops all singletons
-    #   - Summarizer Perplexity gate: 0.0 >= pplx_min_importance_score is always False
-    #   - Brave Search enrichment gate: 0.0 >= brave_enrich_threshold is always False
-    clusters = score_clusters(clusters, settings)
+    # Fixes three silent cascade failures:
+    #   - Singleton filter uses 0.0 score without this → drops all singletons
+    #   - Summarizer Perplexity gate: 0.0 >= pplx_min_importance_score is False
+    #   - Brave Search enrichment gate: 0.0 >= brave_enrich_threshold is False
+    score_clusters(clusters, settings)
 
     # Stage 4: Framing analysis (lexicon-based, no LLM)
     framing_analyzer = FramingAnalyzer()

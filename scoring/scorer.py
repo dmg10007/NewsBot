@@ -20,10 +20,33 @@ Scoring factors (all weights configurable in config/settings.yaml):
 Final score is clamped to [0.0, 1.0] and written back to
 cluster.importance_score in place.
 
+Normalization ceiling
+---------------------
+normalization_ceiling (settings.yaml scoring.weights.normalization_ceiling,
+default 5.0) is the raw score value that maps to 1.0. If source_count_weight
+or tier multipliers are tuned upward, raise this ceiling proportionally to
+keep scores in the 0–1 range. Without this, clusters with many sources will
+all score 1.0 and lose relative distinction.
+
+Score floor
+-----------
+A minimum score of 0.1 is applied after normalization. This prevents clusters
+where all articles lack a published_at timestamp from scoring 0.0 and being
+silently dropped by the singleton filter. A cluster with no pubdate is
+unknown-age, not worthless.
+
+Mutates in place, returns None
+-------------------------------
+score_clusters() mutates cluster.importance_score directly and returns None.
+Callers should NOT reassign the return value (there is none). This avoids the
+mutate-and-return anti-pattern where a function both mutates its argument and
+returns it, creating a false impression that a transformed copy is produced.
+
 Usage (see scheduler/scheduler.py)::
 
     from scoring.scorer import score_clusters
-    clusters = score_clusters(clusters, settings)
+    score_clusters(clusters, settings)
+    # clusters now have importance_score set — no reassignment needed
 """
 
 from __future__ import annotations
@@ -37,23 +60,21 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# Normalization ceiling — raw scores above this value are treated as 1.0.
-# Adjust upward if average cluster sizes grow significantly.
-_SCORE_CEILING = 5.0
+_DEFAULT_SCORE_CEILING = 5.0
+_SCORE_FLOOR = 0.1
 
 
 def score_clusters(
     clusters: list["StoryCluster"],
     settings: dict,
-) -> list["StoryCluster"]:
+) -> None:
     """Score each cluster and write the result to cluster.importance_score.
+
+    Mutates clusters in place. Returns None — do not reassign.
 
     Args:
         clusters: List of StoryCluster objects to score (mutated in place).
         settings: Full settings dict from config.loader.get_settings().
-
-    Returns:
-        The same list, with importance_score set on every cluster.
     """
     weights = settings.get("scoring", {}).get("weights", {})
     source_count_w: float = float(weights.get("source_count", 0.3))
@@ -61,6 +82,9 @@ def score_clusters(
     state_tier_w: float = float(weights.get("state_tier", 1.2))
     national_tier_w: float = float(weights.get("national_tier", 1.0))
     recency_decay_w: float = float(weights.get("recency_decay", 0.05))
+    # Config-driven normalization ceiling. Raise if weight tuning pushes raw
+    # scores above 5.0 and clusters lose relative distinction at the top.
+    score_ceiling: float = float(weights.get("normalization_ceiling", _DEFAULT_SCORE_CEILING))
 
     now = datetime.now(timezone.utc)
 
@@ -76,7 +100,10 @@ def score_clusters(
         else:
             score *= national_tier_w
 
-        # Recency decay: older stories lose importance
+        # Recency decay: older stories lose importance.
+        # If published_at is missing entirely, skip decay — the article is
+        # unknown-age, not worthless. The score floor below prevents it from
+        # being treated as zero-value.
         if cluster.earliest_published is not None:
             pub = cluster.earliest_published
             if pub.tzinfo is None:
@@ -85,8 +112,13 @@ def score_clusters(
             decay = max(0.1, 1.0 - age_hours * recency_decay_w)
             score *= decay
 
-        # Normalize to [0.0, 1.0]
-        cluster.importance_score = min(score / _SCORE_CEILING, 1.0)
+        # Normalize to [0.0, 1.0] then apply floor.
+        # Floor of _SCORE_FLOOR (0.1) ensures clusters with missing pubdate
+        # are not silently eliminated by the singleton importance filter.
+        cluster.importance_score = max(
+            min(score / score_ceiling, 1.0),
+            _SCORE_FLOOR,
+        )
 
     scored_above_threshold = sum(
         1 for c in clusters if c.importance_score >= 0.4
@@ -96,4 +128,3 @@ def score_clusters(
         len(clusters),
         scored_above_threshold,
     )
-    return clusters

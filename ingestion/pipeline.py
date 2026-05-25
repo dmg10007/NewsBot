@@ -25,8 +25,12 @@ sources.yaml organises each tier into two sub-keys::
 FeedFetcher handles RSS sources. Scraper sources are now executed here
 via SCRAPER_REGISTRY. Both paths feed into the same deduplicator.
 
-The function handles its own FeedFetcher lifecycle (open/close). Scrapers
-are also individually opened and closed within the loop.
+Lifecycle
+---------
+FeedFetcher and Deduplicator are both closed in the finally block.
+Deduplicator.close() is currently a no-op but is called explicitly so
+future persistent state (e.g., a seen-URL store) can be cleaned up
+without changing this call site.
 """
 
 from __future__ import annotations
@@ -87,7 +91,6 @@ def ingest_all_sources(sources: dict) -> list[RawArticle]:
     Returns:
         Flat, deduplicated list of RawArticle objects from all tiers.
     """
-    settings = get_settings()
     fetcher = FeedFetcher()
     deduplicator = Deduplicator()
     all_articles: list[RawArticle] = []
@@ -134,6 +137,7 @@ def ingest_all_sources(sources: dict) -> list[RawArticle]:
                     scraper.close()
     finally:
         fetcher.close()
+        deduplicator.close()
 
     before = len(all_articles)
     all_articles = deduplicator.deduplicate(all_articles)

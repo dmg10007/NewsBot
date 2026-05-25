@@ -19,13 +19,21 @@ The original implementation used an O(n²) double-loop calling cos_sim()
 individually for every article pair. This version uses util.semantic_search()
 — one vectorized matrix operation identical to the clustering approach —
 which is dramatically faster for n > ~100 articles.
+
+Lifecycle
+---------
+Deduplicator exposes a close() method as a forward-compatible lifecycle hook.
+It is currently a no-op because the model reference is owned by model_registry
+(not by Deduplicator), but callers (ingestion/pipeline.py) should still call
+it in a finally block so that any future persistent state (e.g., a seen-URL
+database) can be cleaned up without changing call sites.
 """
 
 from __future__ import annotations
 
 import logging
 
-from sentence_transformers import SentenceTransformer, util
+from sentence_transformers import util
 
 from config.loader import get_settings
 from ingestion.fetcher import RawArticle
@@ -94,7 +102,7 @@ class Deduplicator:
                 sim = hit["score"]
                 same_source = articles[i].source_name == articles[j].source_name
 
-                # Within-source dedup: threshold from settings (default ~0.85)
+                # Within-source dedup: threshold from settings (default ~0.95)
                 if same_source and sim >= self._threshold:
                     keep[j] = False
                     logger.debug(
@@ -113,3 +121,12 @@ class Deduplicator:
                     )
 
         return [a for a, k in zip(articles, keep) if k]
+
+    def close(self) -> None:
+        """Lifecycle hook for cleanup. Currently a no-op.
+
+        The model reference is owned by utils.model_registry, not by this
+        class, so there is nothing to release here. This method exists as a
+        forward-compatible hook: if Deduplicator ever acquires persistent state
+        (e.g., a seen-URL SQLite store), callers do not need to change.
+        """

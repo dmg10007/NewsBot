@@ -229,3 +229,18 @@ scoring:
     state_tier: 1.2
     national_tier: 1.0
     recency_decay: 0.05
+    # Raw score value that maps to importance_score = 1.0.
+    # Raise this if weight tuning pushes raw scores above 5.0 and all
+    # high-source clusters collapse to 1.0, losing relative distinction.
+    # Formula: raw_score = source_count * source_count_weight * tier_multiplier
+    # Example: 4 sources * 0.3 * 1.5 (local) = 1.8 -> 1.8/5.0 = 0.36
+    normalization_ceiling: 5.0
+
+monitoring:
+  # Consecutive fetch failures before a WARNING is logged for a source.
+  # Increase for unreliable local outlets; decrease for tier-1 national feeds.
+  failure_alert_threshold: 3
+  # Maximum number of digest run entries kept in run_history.json.
+  # Older entries beyond this cap are trimmed on each append.
+  # At 3 runs/day, 500 entries covers ~166 days of history.
+  max_run_history_entries: 500

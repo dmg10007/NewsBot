@@ -21,6 +21,9 @@ Bias tag colors
 ---------------
 Colors for each bias lean label are read from settings.yaml under
 delivery.email.bias_tag_colors. Hardcoded defaults are used as fallbacks.
+_bias_colors is resolved once at EmailRenderer.__init__() — not on every
+badge render — so get_settings() dict traversal is not repeated for each of
+the ~80 badges in a typical digest.
 
 Example settings.yaml entry::
 
@@ -39,7 +42,6 @@ Example settings.yaml entry::
 from __future__ import annotations
 
 import html
-from typing import Literal
 
 from config.loader import get_settings
 from summarizer.summarizer import SummarizedCluster
@@ -70,18 +72,15 @@ _SECTION_LABELS: dict[str, str] = {
 _SECTION_ORDER: list[str] = ["national", "state", "local"]
 
 
-def _get_bias_colors() -> dict[str, str]:
-    settings = get_settings()
-    return (
-        settings.get("delivery", {})
-               .get("email", {})
-               .get("bias_tag_colors", _DEFAULT_BIAS_COLORS)
-    )
+def _bias_badge(lean: str, colors: dict[str, str]) -> str:
+    """Render a small colored inline badge for a bias lean label.
 
-
-def _bias_badge(lean: str) -> str:
-    """Render a small colored inline badge for a bias lean label."""
-    colors = _get_bias_colors()
+    Args:
+        lean:   Bias lean string (e.g. 'left', 'center-right', 'unknown').
+        colors: Pre-resolved color map from EmailRenderer._bias_colors.
+                Passed as a parameter so callers do not re-traverse settings
+                on every badge render.
+    """
     color = colors.get(lean, _DEFAULT_BIAS_COLORS["unknown"])
     label = _DEFAULT_BIAS_LABELS.get(lean, lean.title())
     return (
@@ -97,10 +96,15 @@ class EmailRenderer:
 
     def __init__(self) -> None:
         settings = get_settings()
+        email_cfg = settings.get("delivery", {}).get("email", {})
         self._max_per_section: int = int(
-            settings.get("delivery", {})
-                    .get("email", {})
-                    .get("max_stories_per_category", 7)
+            email_cfg.get("max_stories_per_category", 7)
+        )
+        # Resolve bias colors once at construction time.
+        # A typical digest renders ~80 badges; resolving the color map here
+        # avoids 80 repeated settings dict traversals per digest run.
+        self._bias_colors: dict[str, str] = (
+            email_cfg.get("bias_tag_colors") or _DEFAULT_BIAS_COLORS
         )
 
     def render(self, summaries: list[SummarizedCluster], period: str) -> str:
@@ -192,15 +196,19 @@ class EmailRenderer:
                 f'<span style="font-weight:700;">{html.escape(story.headline)}</span>'
             )
 
-        # Per-source chips: linked name + bias badge
+        # Per-source chips: linked name + bias badge.
+        # Skip entries where source_name or url is empty — these are malformed
+        # RawArticle entries where source_url was not set during scraping.
         source_chips = ""
         seen: set[str] = set()
         for source_name, url in story.source_links:
+            if not source_name or not url:
+                continue
             if source_name in seen:
                 continue
             seen.add(source_name)
             lean = story.source_bias.get(source_name, "unknown")
-            badge = _bias_badge(lean)
+            badge = _bias_badge(lean, self._bias_colors)
             chip = (
                 f'<a href="{html.escape(url)}" '
                 f'style="display:inline-block;margin:2px 4px 2px 0;'
