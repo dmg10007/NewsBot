@@ -31,7 +31,15 @@ numpy>=2.0.0
 
 # --- NLP / parsing ---
 spacy>=3.8.0
-newspaper3k>=0.2.8
+vaderSentiment>=3.3.2
+python-dateutil>=2.9.0
+
+# --- Scraping ---
+# beautifulsoup4 provides the `bs4` package used in ingestion/scraper.py,
+# ingestion/article_fetcher.py, and bias/source_ratings.py.
+# lxml is used as the BeautifulSoup parser backend ("lxml" parser string).
+beautifulsoup4>=4.12.0
+lxml>=5.0.0
 
 # --- Config / env ---
 pyyaml>=6.0.2
@@ -41,7 +49,8 @@ python-dotenv>=1.0.0
 apscheduler>=3.10.0
 
 # --- Delivery ---
-jinja2>=3.1.0
+# resend is the transactional email SDK used in delivery/email_sender.py.
+resend>=2.0.0
 
 # --- Dev / tooling (not installed in production) ---
 # pip-tools>=7.4        # pip-compile for lock file generation
