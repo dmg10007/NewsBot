@@ -33,6 +33,14 @@ score_clusters() mutates clusters in place and returns None. Call it between
 clustering (Stage 3) and bias analysis (Stage 4); do NOT reassign its return
 value. Downstream consumers (Summarizer, LLMAnalyzer) read importance_score
 to decide whether to use Perplexity, Brave enrichment, or local fallback.
+
+GeoFilter
+---------
+GeoFilter runs between ArticleExtractor (Stage 2) and StoryClusterer (Stage 3).
+It drops articles with no detectable US geographic signal, preventing Reuters
+and AP international wire content from consuming national story slots. The
+filter writes geo_tier='domestic' or 'international' to each RawArticle for
+downstream observability. See parsing/geo_filter.py for tuning details.
 """
 
 from __future__ import annotations
@@ -53,6 +61,7 @@ from delivery.telegram_bot import TelegramSender
 from ingestion.pipeline import ingest_all_sources
 from monitoring.health import record_run
 from parsing.extractor import ArticleExtractor
+from parsing.geo_filter import GeoFilter
 from scoring.scorer import score_clusters
 from summarizer.summarizer import Summarizer
 
@@ -133,6 +142,15 @@ def _run_digest_inner(period: str) -> None:
     # Stage 2: Parse / NLP extraction
     extractor = ArticleExtractor()
     parsed = extractor.extract_all(articles)
+
+    # Stage 2b: Geographic filter — drop international articles before clustering.
+    # Runs after extraction so spaCy entity data is available for signal detection.
+    # Writes geo_tier='domestic'|'international' to each RawArticle for observability.
+    geo_filter = GeoFilter()
+    parsed = geo_filter.filter(parsed)
+    if not parsed:
+        logger.warning("GeoFilter removed all articles — check filter thresholds")
+        return
 
     # Stage 3: Cluster into stories
     clusterer = StoryClusterer()
