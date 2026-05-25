@@ -64,7 +64,7 @@ class ParsedArticle:
     raw: RawArticle
     entities: list[tuple[str, str]]   # (text, label) e.g. ("NC", "GPE")
     keywords: list[str]
-    detected_topics: list[str]        # Intersection of source topics + keyword match
+    detected_topics: list[str]        # Topics detected via keyword matching
     sentiment_compound: float         # VADER compound score: -1.0 to 1.0
     sentiment_label: str              # positive | negative | neutral
     word_count: int
@@ -75,9 +75,7 @@ class ParsedArticle:
         """Focused input for sentence-transformer embedding.
 
         Uses headline + first _CLUSTER_LEAD_CHARS chars of the body rather
-        than the full article text. Lead paragraphs are far more semantically
-        consistent across sources covering the same story than full body text,
-        which diverges due to quotes, bylines, and tangential context.
+        than the full article text.
         """
         lead = (self.full_text or "")[:_CLUSTER_LEAD_CHARS]
         return f"{self.raw.headline}. {lead}".strip()
@@ -129,7 +127,9 @@ class ArticleExtractor:
         else:
             sentiment_label = "neutral"
 
-        detected_topics = self._classify_topics(full_text, article.topics)
+        # article.tags contains RSS <category> values (may be empty)
+        # Pass as hints but always run keyword classification unconditionally
+        detected_topics = self._classify_topics(full_text, article.tags)
 
         return ParsedArticle(
             raw=article,
@@ -142,14 +142,24 @@ class ArticleExtractor:
             full_text=full_text,
         )
 
-    def _classify_topics(self, text: str, source_topics: list[str]) -> list[str]:
-        """Intersect source-declared topics with keyword evidence from the text."""
+    def _classify_topics(self, text: str, source_tags: list[str]) -> list[str]:
+        """Classify article into topics using keyword matching.
+
+        Runs unconditionally against _TOPIC_KEYWORDS — does not filter by
+        source_tags. source_tags (RSS <category> values) are appended as
+        supplementary hints only. Most RSS sources don't populate tags, so
+        gating on them produced 0 topics for the vast majority of articles.
+        """
         text_lower = text.lower()
         matched: list[str] = []
         for topic, keywords in _TOPIC_KEYWORDS.items():
-            if topic not in source_topics:
-                continue
             if any(kw in text_lower for kw in keywords):
                 matched.append(topic)
-        # Fall back to source-declared topics if no keywords match (short summaries)
-        return matched if matched else source_topics
+
+        # Append any source-declared tags not already covered
+        for tag in source_tags:
+            tag_norm = tag.lower().strip()
+            if tag_norm and tag_norm not in matched:
+                matched.append(tag_norm)
+
+        return matched if matched else ["general"]
