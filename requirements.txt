@@ -40,6 +40,9 @@ python-dateutil>=2.9.0
 # lxml is used as the BeautifulSoup parser backend ("lxml" parser string).
 beautifulsoup4>=4.12.0
 lxml>=5.0.0
+# playwright drives a headless Chromium browser to bypass Cloudflare WAF on
+# allsides.com. After pip install, run: playwright install chromium
+playwright>=1.44.0
 
 # --- Config / env ---
 pyyaml>=6.0.2

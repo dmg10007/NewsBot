@@ -4,8 +4,25 @@ Builds a normalized lookup table: domain -> {bias_lean, factuality, confidence}.
 Designed to be called once at startup (or weekly via cron) and cached in memory.
 
 No paid API required:
-  AllSides  — scrapes public media bias ratings page (single request, sync)
-  MBFC      — scrapes public search + detail pages (sequential, rate-limited)
+  AllSides  — rendered via Playwright headless Chromium to bypass Cloudflare WAF.
+              Falls back to _ALLSIDES_STATIC if Playwright is unavailable.
+  MBFC      — scrapes public search + detail pages via httpx (sequential, rate-limited)
+
+AllSides / Cloudflare note
+--------------------------
+AllSides runs Cloudflare bot detection that blocks plain httpx requests with a 403.
+A real Chromium instance (via Playwright) passes fingerprinting checks that
+Cloudflare uses to distinguish browsers from scripts. headless=True is sufficient
+because Cloudflare checks TLS JA3 fingerprints and JS challenge responses, both of
+which Playwright satisfies.
+
+If playwright is not installed or Chromium is unavailable, scrape_allsides() falls
+back to _ALLSIDES_STATIC — a hardcoded table of ratings for the sources in
+config/sources.yaml. Update this table when you add new sources.
+
+To install Playwright:
+    pip install playwright
+    playwright install chromium
 
 MBFC crawl posture
 ------------------
@@ -16,11 +33,6 @@ default is deliberately conservative to avoid 429s.
 
 Each domain requires 2 HTTP requests: search page + detail page.
 For 17 domains at 2.0s delay: ~35s total — acceptable for a weekly job.
-
-AllSides anti-bot mitigation
-----------------------------
-AllSides uses Cloudflare bot detection. We send a full browser-like header
-set (UA + Accept + Accept-Language + Sec-Fetch-*) on all outbound requests.
 """
 
 from __future__ import annotations
@@ -37,8 +49,7 @@ from bs4 import BeautifulSoup
 
 logger = logging.getLogger(__name__)
 
-# Full browser header set — required to pass Cloudflare / AllSides bot checks.
-# UA alone is insufficient; Sec-Fetch-* and Accept-Language are also checked.
+# Full browser header set used for MBFC requests.
 _BROWSER_HEADERS: dict[str, str] = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -81,7 +92,34 @@ class SourceRating:
 
 
 # ---------------------------------------------------------------------------
-# AllSides scraper (synchronous — single request)
+# AllSides static fallback
+# ---------------------------------------------------------------------------
+# Used when Playwright is unavailable. Update when adding new sources.
+# Ratings sourced from allsides.com/media-bias/ratings (May 2026).
+
+_ALLSIDES_STATIC: dict[str, str] = {
+    "apnews.com":              "center",
+    "reuters.com":             "center",
+    "npr.org":                 "center-left",
+    "pbs.org":                 "center",
+    "cnn.com":                 "center-left",
+    "foxnews.com":             "right",
+    "foxbusiness.com":         "right",
+    "thehill.com":             "center",
+    "axios.com":               "center",
+    "wsj.com":                 "center-right",
+    "wral.com":                "center",
+    "charlotteobserver.com":   "center-left",
+    "ncpolicywatch.com":       "center-left",
+    "carolinapublicpress.org": "center",
+    "wcnc.com":                "center",
+    "sanfordherald.com":       "center",
+    "rantnc.com":              "center",
+}
+
+
+# ---------------------------------------------------------------------------
+# AllSides scraper — Playwright (primary path)
 # ---------------------------------------------------------------------------
 
 _ALLSIDES_BIAS_MAP: dict[str, str] = {
@@ -102,22 +140,13 @@ def _normalize_allsides_bias(raw: str) -> Optional[str]:
     return _ALLSIDES_BIAS_MAP.get(raw.strip().lower())
 
 
-def scrape_allsides(client: httpx.Client) -> dict[str, str]:
-    """Scrape AllSides media bias ratings page.
+def _parse_allsides_html(html: str) -> dict[str, str]:
+    """Parse the AllSides ratings table from raw HTML.
 
-    Uses a full browser header set (not just UA) to pass Cloudflare checks.
+    Shared by the Playwright path and any future path that can supply HTML.
     """
-    url = "https://www.allsides.com/media-bias/ratings"
     ratings: dict[str, str] = {}
-
-    try:
-        resp = client.get(url, timeout=20, headers=_BROWSER_HEADERS)
-        resp.raise_for_status()
-    except Exception as exc:
-        logger.error("AllSides scrape failed: %s", exc)
-        return ratings
-
-    soup = BeautifulSoup(resp.text, "lxml")
+    soup = BeautifulSoup(html, "lxml")
     table = soup.find("table", {"class": re.compile(r"views-table")})
     if not table:
         logger.warning("AllSides: could not find ratings table — page structure may have changed")
@@ -142,7 +171,70 @@ def scrape_allsides(client: httpx.Client) -> dict[str, str]:
         if normalized:
             ratings[domain] = normalized
 
-    logger.info("AllSides: scraped %d source ratings", len(ratings))
+    logger.info("AllSides: scraped %d source ratings via Playwright", len(ratings))
+    return ratings
+
+
+def scrape_allsides(client: httpx.Client) -> dict[str, str]:
+    """Scrape AllSides ratings using Playwright headless Chromium.
+
+    Playwright is required to pass Cloudflare bot detection on allsides.com.
+    If playwright or its Chromium browser is not installed, logs a warning and
+    returns the static fallback table instead.
+
+    `client` is accepted for API compatibility but not used — Playwright
+    manages its own browser-level networking.
+
+    Install:
+        pip install playwright
+        playwright install chromium
+    """
+    try:
+        from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
+    except ImportError:
+        logger.warning(
+            "AllSides: playwright not installed — using static fallback table. "
+            "Run: pip install playwright && playwright install chromium"
+        )
+        return dict(_ALLSIDES_STATIC)
+
+    url = "https://www.allsides.com/media-bias/ratings"
+
+    try:
+        with sync_playwright() as pw:
+            browser = pw.chromium.launch(headless=True)
+            context = browser.new_context(
+                # Mimic a real desktop browser viewport + locale
+                viewport={"width": 1280, "height": 800},
+                locale="en-US",
+                user_agent=(
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/124.0.0.0 Safari/537.36"
+                ),
+            )
+            page = context.new_page()
+            # wait_until="networkidle" ensures JS-rendered content (including
+            # any Cloudflare challenge resolution) is complete before we read.
+            page.goto(url, wait_until="networkidle", timeout=30_000)
+            html = page.content()
+            browser.close()
+    except PWTimeout:
+        logger.warning(
+            "AllSides: Playwright timed out loading ratings page — using static fallback"
+        )
+        return dict(_ALLSIDES_STATIC)
+    except Exception as exc:
+        logger.warning(
+            "AllSides: Playwright scrape failed (%s) — using static fallback", exc
+        )
+        return dict(_ALLSIDES_STATIC)
+
+    ratings = _parse_allsides_html(html)
+    if not ratings:
+        logger.warning("AllSides: Playwright returned HTML but parse yielded 0 ratings — using static fallback")
+        return dict(_ALLSIDES_STATIC)
+
     return ratings
 
 
@@ -194,7 +286,6 @@ _OUTLET_DOMAIN_MAP: dict[str, str] = {
 }
 
 # Map domain -> preferred MBFC search term when the domain slug gives bad results.
-# MBFC's search is fuzzy; some outlets only surface correctly under their full name.
 _MBFC_SEARCH_MAP: dict[str, str] = {
     "apnews.com": "associated press",
     "wsj.com": "wall street journal",
@@ -240,10 +331,6 @@ _MBFC_FACTUALITY_MAP: dict[str, str] = {
     "very low": "very-low",
 }
 
-# A profile URL has exactly one path segment (the slug), e.g.:
-#   mediabiasfactcheck.com/reuters/         -> GOOD
-#   mediabiasfactcheck.com/left/cnn-bias/   -> BAD (sub-directory)
-#   mediabiasfactcheck.com/2017/02/26/...   -> BAD (date-based article)
 _MBFC_PROFILE_RE = re.compile(
     r"https?://mediabiasfactcheck\.com/([^/]+)/$"
 )
@@ -277,7 +364,6 @@ async def scrape_mbfc_source_async(
 
     soup = BeautifulSoup(resp.text, "lxml")
 
-    # Walk all article links and pick the first that looks like a source profile.
     detail_url: Optional[str] = None
     for a in soup.select("h2.entry-title a, h3.entry-title a, .post-title a, article a"):
         href = a.get("href", "")
@@ -313,10 +399,7 @@ async def scrape_mbfc_bulk_async(
 ) -> dict[str, dict]:
     """Async: scrape MBFC for a list of domains with concurrency control.
 
-    Default is max_concurrent=1 (fully sequential) with a 2.0s delay —
-    the safe posture for a weekly cron hitting a small WordPress site.
-    Raise max_concurrent only if you know the target can handle it.
-
+    Default is max_concurrent=1 (fully sequential) with a 2.0s delay.
     Returns: {domain: {bias, factuality}}
     """
     sem = asyncio.Semaphore(max_concurrent)
@@ -371,31 +454,19 @@ def scrape_mbfc_bulk(
 
 
 # ---------------------------------------------------------------------------
-# MBFC detail page parser (shared by sync and async paths)
+# MBFC detail page parser
 # ---------------------------------------------------------------------------
 
 def _parse_mbfc_detail(soup: BeautifulSoup, domain: str = "") -> Optional[dict]:
-    """Extract bias and factuality from an MBFC detail page.
-
-    MBFC formats the Detailed Report block as a <p> or <li> containing lines like:
-        Bias Rating: LEAST BIASED (-0.5)
-        Factual Reporting: VERY HIGH (0.0)
-
-    We locate the element containing 'Bias Rating:' and parse from its text
-    rather than running a regex over the entire page (which previously matched
-    comment section text and failed on bold markers).
-    """
+    """Extract bias and factuality from an MBFC detail page."""
     bias: Optional[str] = None
     factuality: Optional[str] = None
 
-    # Strategy 1: find the structured "Detailed Report" block.
-    # MBFC wraps it in a <p> or <li> that contains both labels.
     for tag in soup.find_all(["p", "li", "div"]):
         text = tag.get_text(separator=" ", strip=True)
         if "Bias Rating:" not in text and "bias rating:" not in text.lower():
             continue
 
-        # Extract bias from this block
         b_match = re.search(
             r"[Bb]ias\s+[Rr]ating\s*:\s*\**([A-Z][A-Z\s\-]+?)\**\s*(?:\(|[A-Z]{2,}|\n|$)",
             text,
@@ -404,7 +475,6 @@ def _parse_mbfc_detail(soup: BeautifulSoup, domain: str = "") -> Optional[dict]:
             raw_bias = b_match.group(1).strip().rstrip("-").lower()
             bias = _MBFC_BIAS_MAP.get(raw_bias)
 
-        # Extract factuality from the same block or the next sibling
         f_match = re.search(
             r"[Ff]actual\s+[Rr]eporting\s*:\s*\**([A-Z][A-Z\s]+?)\**\s*(?:\(|[A-Z]{2,}|\n|$)",
             text,
@@ -416,8 +486,6 @@ def _parse_mbfc_detail(soup: BeautifulSoup, domain: str = "") -> Optional[dict]:
         if bias or factuality:
             break
 
-    # Strategy 2: fallback — scan the full page text with relaxed patterns.
-    # Handles pages where the report block uses unusual markup.
     if not bias and not factuality:
         full_text = soup.get_text(separator="\n", strip=True)
 
