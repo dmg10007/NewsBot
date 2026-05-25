@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import re
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -39,6 +40,74 @@ import httpx
 from config.loader import get_settings, get_sources
 
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Ad / promo filter
+# ---------------------------------------------------------------------------
+
+# URL substrings that indicate ad-injected or partner content.
+_AD_URL_PATTERNS: frozenset[str] = frozenset({
+    "bestreviews.com",
+    "underscored.com",        # CNN Underscored shopping vertical
+    "cnn.com/cnn-underscored",
+    "ad.doubleclick.net",
+    "sponsored",
+    "partner-content",
+    "brandstudio",
+})
+
+# Headline phrases (lowercase) that reliably identify ads, promos, or
+# low-value evergreen filler scraped from RSS injection slots.
+_AD_HEADLINE_PHRASES: tuple[str, ...] = (
+    "0% intro apr",
+    "0% interest",
+    "cash back card",
+    "cash back bonus",
+    "home equity loan",
+    "home equity into cash",
+    "credit card interest",
+    "cards charging 0%",
+    "turn your rising home equity",
+    "want cash out of your home",
+    "use the right card",
+    "dream big with a home equity",
+    # Podcast / newsletter items with no real news content
+    "cnn political briefing",
+    "the axe files",
+    "margins of error",
+    "politics of the day",
+)
+
+# Regex for bare section-index headlines like "World News | Latest Top Stories"
+_SECTION_INDEX_RE = re.compile(
+    r"^(world|asia|europe|business|us|uk|middle east|americas|africa|sports|tech)"
+    r"\s+(news|headlines|stories)",
+    re.IGNORECASE,
+)
+
+
+def _is_ad(headline: str, url: str, summary: str) -> bool:
+    """Return True if this RSS entry looks like an ad, promo, or filler.
+
+    Checks (in order, short-circuits on first match):
+    1. URL contains a known ad-network or shopping-vertical substring.
+    2. Headline matches a known promotional phrase.
+    3. Headline matches the section-index pattern (bare nav entries).
+    """
+    url_lower = url.lower()
+    for pat in _AD_URL_PATTERNS:
+        if pat in url_lower:
+            return True
+
+    headline_lower = headline.lower()
+    for phrase in _AD_HEADLINE_PHRASES:
+        if phrase in headline_lower:
+            return True
+
+    if _SECTION_INDEX_RE.match(headline.strip()):
+        return True
+
+    return False
 
 
 @dataclass
@@ -106,10 +175,22 @@ class FeedFetcher:
             logger.warning("Feed parse warning for %s: %s", url, feed.bozo_exception)
 
         articles: list[RawArticle] = []
+        ads_filtered = 0
         for entry in feed.entries[: self._max_per_source]:
             headline = entry.get("title", "").strip()
             article_url = entry.get("link", "").strip()
             if not headline or not article_url:
+                continue
+
+            summary = ""
+            if entry.get("summary"):
+                summary = entry["summary"]
+            elif entry.get("content"):
+                summary = entry["content"][0].get("value", "")
+
+            # Drop ads/promos before any further processing
+            if _is_ad(headline, article_url, summary):
+                ads_filtered += 1
                 continue
 
             published_at: Optional[datetime] = None
@@ -118,12 +199,6 @@ class FeedFetcher:
                     published_at = datetime(*entry.published_parsed[:6])
                 except (TypeError, ValueError):
                     pass
-
-            summary = ""
-            if entry.get("summary"):
-                summary = entry["summary"]
-            elif entry.get("content"):
-                summary = entry["content"][0].get("value", "")
 
             # Extract feed-provided topic tags from RSS <category> elements
             tags: list[str] = [
@@ -146,6 +221,11 @@ class FeedFetcher:
                 tags=tags,
             ))
 
+        if ads_filtered:
+            logger.info(
+                "Ad filter: dropped %d promotional entries from %s",
+                ads_filtered, source["name"]
+            )
         time.sleep(self._delay)
         return articles
 
