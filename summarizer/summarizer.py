@@ -79,6 +79,7 @@ Environment variables
 
 from __future__ import annotations
 
+import html as html_module
 import logging
 import os
 import re
@@ -86,6 +87,7 @@ import threading
 import time
 from concurrent.futures import Future, ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 from dataclasses import dataclass, field
+from html.parser import HTMLParser
 from typing import Optional
 
 import httpx
@@ -116,6 +118,43 @@ _NEUTRAL_SYSTEM_PROMPT = (
     "summary containing only verifiable facts. Remove editorial framing, "
     "emotional language, and opinion. Use plain, direct language."
 )
+
+
+# ---------------------------------------------------------------------------
+# HTML stripping
+# ---------------------------------------------------------------------------
+
+class _TextExtractor(HTMLParser):
+    """stdlib HTMLParser subclass that discards all tags and collects text."""
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self._parts: list[str] = []
+
+    def handle_data(self, data: str) -> None:  # noqa: D401
+        stripped = data.strip()
+        if stripped:
+            self._parts.append(stripped)
+
+    def get_text(self) -> str:
+        return " ".join(self._parts)
+
+
+def _strip_html(text: str) -> str:
+    """Return plain text with all HTML tags removed and entities decoded.
+
+    Uses stdlib html.parser — no extra dependencies. Safe to call on
+    strings that contain no HTML; returns them unchanged.
+    """
+    if not text or "<" not in text:
+        return text
+    parser = _TextExtractor()
+    try:
+        parser.feed(text)
+        return parser.get_text()
+    except Exception:
+        # Malformed HTML edge case — fall back to regex strip
+        return re.sub(r"<[^>]+>", " ", html_module.unescape(text)).strip()
 
 
 @dataclass
@@ -212,7 +251,6 @@ class LocalLLMClient:
     def __init__(self, model: str, timeout: float = 45.0) -> None:
         base = os.getenv("LLAMA_CPP_BASE_URL", _LOCAL_LLM_DEFAULT_BASE).rstrip("/")
         self._url = f"{base}/v1/chat/completions"
-        # env var takes precedence over settings value
         self._model = os.getenv("LLAMA_CPP_MODEL", model)
         self._client = httpx.Client(
             timeout=httpx.Timeout(connect=5.0, read=timeout, write=10.0, pool=5.0)
@@ -242,17 +280,7 @@ class LocalLLMClient:
 
 
 class Summarizer:
-    """Produces neutral summaries for each StoryCluster.
-
-    Routing:
-      - Clusters at or above pplx_min_importance_score -> Perplexity (if key set,
-        cap not reached, and request succeeds after retries)
-      - All other clusters -> local llama.cpp (if LLAMA_CPP_BASE_URL is set)
-      - Final fallback -> extractive (first 3 sentences, no LLM)
-
-    Lifecycle: call close() (or use as a context manager) when done to release
-    the underlying httpx connection pools.
-    """
+    """Produces neutral summaries for each StoryCluster."""
 
     def __init__(self) -> None:
         self.settings = get_settings()
@@ -266,14 +294,12 @@ class Summarizer:
         self._cluster_timeout: float = float(s.get("cluster_timeout_seconds", _DEFAULT_CLUSTER_TIMEOUT))
         self._max_summary_tokens: int = int(s.get("max_summary_tokens", 150))
 
-        # Rate-limit controls
         self._pplx_call_delay: float = float(s.get("pplx_call_delay_seconds", _DEFAULT_PPLX_DELAY))
         self._pplx_max_calls: int = int(s.get("pplx_max_calls_per_run", _DEFAULT_PPLX_MAX_CALLS))
         self._pplx_min_score: float = float(s.get("pplx_min_importance_score", _DEFAULT_PPLX_MIN_SCORE))
         self._pplx_retry_attempts: int = int(s.get("pplx_retry_attempts", _DEFAULT_PPLX_RETRY_ATTEMPTS))
         self._pplx_retry_base_delay: float = float(s.get("pplx_retry_base_delay", _DEFAULT_PPLX_RETRY_BASE_DELAY))
 
-        # Thread-safe Perplexity call counter + throttle lock
         self._pplx_calls: int = 0
         self._pplx_call_lock: threading.Lock = threading.Lock()
         self._pplx_throttle_lock: threading.Lock = threading.Lock()
@@ -378,13 +404,6 @@ class Summarizer:
         )
 
     def _route_summary(self, cluster: StoryCluster, input_text: str) -> tuple[str, str]:
-        """Decide which backend to use and return (summary_text, backend_name).
-
-        Priority:
-          1. Perplexity  — if key present, score >= threshold, cap not reached
-          2. Local LLM   — all other cases where local model is available
-          3. Extractive  — last resort when no LLM is reachable
-        """
         use_perplexity = False
 
         if self._pplx_key and cluster.importance_score >= self._pplx_min_score:
@@ -407,13 +426,11 @@ class Summarizer:
             summary, succeeded = self._call_with_throttle_and_retry(cluster.cluster_id, input_text)
             if succeeded:
                 return summary, "perplexity"
-            # Perplexity failed after retries — fall through to local LLM
             logger.warning(
                 "Cluster %d: Perplexity failed — falling through to local LLM",
                 cluster.cluster_id,
             )
 
-        # Local LLM path
         if self._local_llm.available():
             try:
                 summary = self._local_llm.summarize(input_text, max_tokens=self._max_summary_tokens)
@@ -424,17 +441,11 @@ class Summarizer:
                     cluster.cluster_id, exc,
                 )
 
-        # Extractive last resort
         return self._extractive_fallback(input_text), "extractive"
 
     def _call_with_throttle_and_retry(
         self, cluster_id: int, input_text: str
     ) -> tuple[str, bool]:
-        """Acquire throttle lock, enforce inter-call delay, then call with retry.
-
-        Returns (summary, success). On failure returns (extractive_text, False)
-        so the caller can decide whether to fall through to local LLM.
-        """
         with self._pplx_throttle_lock:
             time.sleep(self._pplx_call_delay)
             try:
@@ -445,20 +456,11 @@ class Summarizer:
                     "Perplexity failed for cluster %d after retries: %s",
                     cluster_id, exc,
                 )
-                # Release the call slot so a future run can use it
                 with self._pplx_call_lock:
                     self._pplx_calls = max(0, self._pplx_calls - 1)
                 return self._extractive_fallback(input_text), False
 
     def _call_perplexity_with_retry(self, input_text: str) -> str:
-        """Call Perplexity with exponential backoff on 429 / 5xx responses.
-
-        Retries up to self._pplx_retry_attempts times. On a 429, respects
-        the Retry-After header if present; otherwise uses exponential backoff
-        starting at pplx_retry_base_delay seconds.
-
-        Raises the last exception if all attempts are exhausted.
-        """
         last_exc: Exception = RuntimeError("No attempts made")
         for attempt in range(self._pplx_retry_attempts + 1):
             try:
@@ -506,16 +508,30 @@ class Summarizer:
         return response.json()["choices"][0]["message"]["content"].strip()
 
     def _build_input_text(self, cluster: StoryCluster) -> str:
+        """Build plain-text input for the LLM from article full text or RSS summary.
+
+        RSS summaries from Reuters, AP, CNN etc. are HTML documents. Strip all
+        tags before feeding to the LLM so the model sees clean prose, not markup.
+        """
         parts = []
         for article in cluster.articles:
             full_text = self._article_fetcher.fetch(article.raw.url)
-            text = full_text if full_text else article.raw.summary
-            # Source names excluded from prompt — see code review item #9
-            parts.append(text or "")
-        return "\n\n---\n\n".join(parts)
+            if full_text:
+                # trafilatura already returns clean plain text
+                parts.append(full_text)
+            else:
+                # RSS fallback — may contain HTML; strip it
+                parts.append(_strip_html(article.raw.summary or ""))
+        return "\n\n---\n\n".join(p for p in parts if p)
 
     def _extractive_fallback(self, text: str) -> str:
-        sentences = re.split(r'(?<=[.!?])\s+', text.strip())
+        """Return the first 3 sentences of text as a plain-text summary.
+
+        Strip HTML first — defence-in-depth in case anything HTML-containing
+        reaches this path from outside _build_input_text.
+        """
+        clean = _strip_html(text)
+        sentences = re.split(r'(?<=[.!?])\s+', clean.strip())
         return " ".join(sentences[:3])
 
     def _fallback_summary(self, cluster: StoryCluster) -> SummarizedCluster:

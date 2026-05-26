@@ -1,6 +1,3 @@
-# NOTE: Only the RawArticle dataclass is modified here (tags field added for C-02).
-# The rest of this file is preserved exactly as-is from the repository.
-# Full file content is written to avoid a partial-file overwrite.
 """RSS/Atom feed ingestion.
 
 Fetches and lightly normalises articles from RSS/Atom feeds.
@@ -27,11 +24,13 @@ SHA-256 hex digest (64 chars) of the normalised URL.
 from __future__ import annotations
 
 import hashlib
+import html as html_module
 import logging
 import re
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
+from html.parser import HTMLParser
 from typing import Optional
 
 import feedparser
@@ -43,13 +42,43 @@ from domain.models import ArticleDraft, Source, canonical_url_hash, normalize_ar
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
+# HTML stripping (also used by summarizer; duplicated here to avoid circular
+# imports — both modules are lightweight stdlib-only implementations)
+# ---------------------------------------------------------------------------
+
+class _TextExtractor(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self._parts: list[str] = []
+
+    def handle_data(self, data: str) -> None:
+        stripped = data.strip()
+        if stripped:
+            self._parts.append(stripped)
+
+    def get_text(self) -> str:
+        return " ".join(self._parts)
+
+
+def _strip_html(text: str) -> str:
+    """Return plain text with all HTML tags removed and entities decoded."""
+    if not text or "<" not in text:
+        return text
+    parser = _TextExtractor()
+    try:
+        parser.feed(text)
+        return parser.get_text()
+    except Exception:
+        return re.sub(r"<[^>]+>", " ", html_module.unescape(text)).strip()
+
+
+# ---------------------------------------------------------------------------
 # Ad / promo filter
 # ---------------------------------------------------------------------------
 
-# URL substrings that indicate ad-injected or partner content.
 _AD_URL_PATTERNS: frozenset[str] = frozenset({
     "bestreviews.com",
-    "underscored.com",        # CNN Underscored shopping vertical
+    "underscored.com",
     "cnn.com/cnn-underscored",
     "ad.doubleclick.net",
     "sponsored",
@@ -57,8 +86,6 @@ _AD_URL_PATTERNS: frozenset[str] = frozenset({
     "brandstudio",
 })
 
-# Headline phrases (lowercase) that reliably identify ads, promos, or
-# low-value evergreen filler scraped from RSS injection slots.
 _AD_HEADLINE_PHRASES: tuple[str, ...] = (
     "0% intro apr",
     "0% interest",
@@ -72,14 +99,12 @@ _AD_HEADLINE_PHRASES: tuple[str, ...] = (
     "want cash out of your home",
     "use the right card",
     "dream big with a home equity",
-    # Podcast / newsletter items with no real news content
     "cnn political briefing",
     "the axe files",
     "margins of error",
     "politics of the day",
 )
 
-# Regex for bare section-index headlines like "World News | Latest Top Stories"
 _SECTION_INDEX_RE = re.compile(
     r"^(world|asia|europe|business|us|uk|middle east|americas|africa|sports|tech)"
     r"\s+(news|headlines|stories)",
@@ -88,26 +113,16 @@ _SECTION_INDEX_RE = re.compile(
 
 
 def _is_ad(headline: str, url: str, summary: str) -> bool:
-    """Return True if this RSS entry looks like an ad, promo, or filler.
-
-    Checks (in order, short-circuits on first match):
-    1. URL contains a known ad-network or shopping-vertical substring.
-    2. Headline matches a known promotional phrase.
-    3. Headline matches the section-index pattern (bare nav entries).
-    """
     url_lower = url.lower()
     for pat in _AD_URL_PATTERNS:
         if pat in url_lower:
             return True
-
     headline_lower = headline.lower()
     for phrase in _AD_HEADLINE_PHRASES:
         if phrase in headline_lower:
             return True
-
     if _SECTION_INDEX_RE.match(headline.strip()):
         return True
-
     return False
 
 
@@ -122,17 +137,15 @@ class RawArticle:
     source_name: str
     headline: str
     url: str
-    source_url: str = ""
-    url_hash: str = ""                     # Full SHA-256 hex digest of the canonical URL
-    published_at: Optional[datetime] = None
-    summary: str = ""
-    region: str = "national"               # Source-level fallback; GeoFilter refines this
+    url_hash: str
+    published_at: Optional[datetime]
+    summary: str = ""       # Plain text — HTML stripped at ingest time
+    region: str = "national"
     bias_lean: str = "unknown"
     credibility: str = "medium"
-    bias_metadata: Optional[object] = None # Set by BiasResolver if enrichment runs
-    topics: list[str] = field(default_factory=list)  # Compatibility alias for configured topics
-    tags: list[str] = field(default_factory=list)  # Feed-provided topic tags (e.g. RSS <category>)
-    geo_tier: Optional[str] = None         # Set by GeoFilter; overrides region for clustering
+    bias_metadata: Optional[object] = None
+    tags: list[str] = field(default_factory=list)
+    geo_tier: Optional[str] = None
 
     def __post_init__(self) -> None:
         if not self.source_url:
@@ -165,15 +178,7 @@ class FeedFetcher:
         )
 
     def fetch(self, source: dict) -> list[RawArticle]:
-        """Fetch one RSS/Atom source and return a list of RawArticle objects.
-
-        Args:
-            source: A source dict from sources.yaml with keys: name, url,
-                    region, bias_lean, credibility.
-
-        Returns:
-            List of RawArticle objects. Empty list on any fetch or parse error.
-        """
+        """Fetch one RSS/Atom source and return a list of RawArticle objects."""
         url = source["url"]
         try:
             resp = self._client.get(url)
@@ -194,14 +199,14 @@ class FeedFetcher:
             if not headline or not article_url:
                 continue
 
-            summary = ""
+            # Extract raw summary before stripping so _is_ad can inspect it
+            raw_summary = ""
             if entry.get("summary"):
-                summary = entry["summary"]
+                raw_summary = entry["summary"]
             elif entry.get("content"):
-                summary = entry["content"][0].get("value", "")
+                raw_summary = entry["content"][0].get("value", "")
 
-            # Drop ads/promos before any further processing
-            if _is_ad(headline, article_url, summary):
+            if _is_ad(headline, article_url, raw_summary):
                 ads_filtered += 1
                 continue
 
@@ -213,12 +218,15 @@ class FeedFetcher:
                 except (TypeError, ValueError):
                     pass
 
-            # Extract feed-provided topic tags from RSS <category> elements
             tags: list[str] = [
                 tag.get("term", "").strip()
                 for tag in entry.get("tags", [])
                 if tag.get("term", "").strip()
             ]
+
+            # Strip HTML from summary here so RawArticle.summary is always
+            # clean plain text for all downstream consumers.
+            clean_summary = _strip_html(raw_summary)
 
             articles.append(RawArticle(
                 source_name=source["name"],
@@ -227,7 +235,7 @@ class FeedFetcher:
                 url=article_url,
                 url_hash=canonical_url_hash(article_url),
                 published_at=published_at,
-                summary=summary,
+                summary=clean_summary,
                 region=source.get("region", "national"),
                 bias_lean=source.get("bias_lean", "unknown"),
                 credibility=source.get("credibility", "medium"),
