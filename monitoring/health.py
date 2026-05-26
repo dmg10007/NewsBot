@@ -50,6 +50,7 @@ RUN_LOG_PATH = Path(os.getenv("NEWSBOT_RUN_LOG", "logs/run_history.json"))
 
 _DEFAULT_FAILURE_ALERT_THRESHOLD = 3
 _DEFAULT_MAX_RUN_HISTORY = 500
+FAILURE_ALERT_THRESHOLD = _DEFAULT_FAILURE_ALERT_THRESHOLD
 
 # ---------------------------------------------------------------------------
 # Cross-platform file locking shim

@@ -58,7 +58,7 @@ def test_cluster_single_article():
     clusters = clusterer.cluster(articles)
     assert len(clusters) == 1
     assert clusters[0].source_count == 1
-    assert clusters[0].is_single_source is False  # is_single_source is on SummaryResult not StoryCluster
+    assert clusters[0].is_single_source is True
 
 
 def test_story_cluster_metadata():

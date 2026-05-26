@@ -47,3 +47,5 @@ htmlcov/
 
 # NewsBot runtime cache
 .newsbot_cache/
+data/*.sqlite
+data/*.sqlite-*

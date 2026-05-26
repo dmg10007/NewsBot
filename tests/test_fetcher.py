@@ -69,17 +69,19 @@ def _make_raw_article(
 
 @patch("feedparser.parse")
 def test_fetch_all_returns_articles(mock_parse):
-    mock_entry_1 = MagicMock()
-    mock_entry_1.title = "Test Headline One"
-    mock_entry_1.link = "https://example.com/story-1"
-    mock_entry_1.summary = "A summary of story one."
-    mock_entry_1.published_parsed = (2026, 5, 21, 10, 0, 0, 0, 0, 0)
+    mock_entry_1 = {
+        "title": "Test Headline One",
+        "link": "https://example.com/story-1",
+        "summary": "A summary of story one.",
+        "published_parsed": (2026, 5, 21, 10, 0, 0, 0, 0, 0),
+    }
 
-    mock_entry_2 = MagicMock()
-    mock_entry_2.title = "Test Headline Two"
-    mock_entry_2.link = "https://example.com/story-2"
-    mock_entry_2.summary = "A summary of story two."
-    mock_entry_2.published_parsed = (2026, 5, 21, 11, 0, 0, 0, 0, 0)
+    mock_entry_2 = {
+        "title": "Test Headline Two",
+        "link": "https://example.com/story-2",
+        "summary": "A summary of story two.",
+        "published_parsed": (2026, 5, 21, 11, 0, 0, 0, 0, 0),
+    }
 
     mock_feed = MagicMock()
     mock_feed.entries = [mock_entry_1, mock_entry_2]
@@ -87,6 +89,10 @@ def test_fetch_all_returns_articles(mock_parse):
     mock_parse.return_value = mock_feed
 
     fetcher = FeedFetcher()
+    mock_response = MagicMock()
+    mock_response.text = SAMPLE_FEED_XML
+    mock_response.raise_for_status.return_value = None
+    fetcher._client.get = MagicMock(return_value=mock_response)
     articles = fetcher.fetch_all([SAMPLE_SOURCE])
 
     assert len(articles) == 2
