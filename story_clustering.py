@@ -1,12 +1,15 @@
-"""Story clustering for domain Article objects."""
+"""Story clustering and digest story selection for domain Article objects."""
 
 from __future__ import annotations
 
+import logging
 from collections import defaultdict
 from datetime import datetime, timezone
 from difflib import SequenceMatcher
 
 from domain.models import Article, StoryCluster
+
+logger = logging.getLogger(__name__)
 
 
 class StoryClusterer:
@@ -84,11 +87,57 @@ def filter_reportable_clusters(clusters: list[StoryCluster], settings: dict) -> 
     threshold = float(
         settings.get("clustering", {}).get("drop_singletons_below_importance", 0.4)
     )
-    return [
+    reportable = [
         cluster
         for cluster in clusters
         if not cluster.is_single_source or cluster.importance_score >= threshold
     ]
+    logger.info(
+        "Reportable cluster filter: %d -> %d clusters (singleton threshold %.2f)",
+        len(clusters), len(reportable), threshold,
+    )
+    return reportable
+
+
+def select_digest_clusters(clusters: list[StoryCluster], settings: dict) -> list[StoryCluster]:
+    """Select a bounded digest set while preserving useful single-source stories.
+
+    Multi-source coverage is preferred, but local/state/national digests still
+    need worthwhile single-source stories. Without this pass, a run with many
+    valid singleton clusters can collapse to only the handful of stories that
+    multiple configured outlets happened to cover.
+    """
+    delivery_cfg = settings.get("delivery", {}).get("email", {})
+    max_per_tier = int(delivery_cfg.get("max_stories_per_category", 7))
+    cluster_cfg = settings.get("clustering", {})
+    singleton_floor = float(cluster_cfg.get("singleton_digest_floor", 0.1))
+    min_singletons_per_tier = int(cluster_cfg.get("min_singletons_per_tier", 3))
+
+    selected: list[StoryCluster] = []
+    for tier in ("national", "state", "local"):
+        tier_clusters = [c for c in clusters if c.geo_tier == tier]
+        tier_clusters.sort(key=_selection_key, reverse=True)
+        multi = [c for c in tier_clusters if not c.is_single_source]
+        singletons = [
+            c for c in tier_clusters
+            if c.is_single_source and c.importance_score >= singleton_floor
+        ]
+
+        tier_selected = multi[:max_per_tier]
+        remaining = max_per_tier - len(tier_selected)
+        if remaining > 0:
+            tier_selected.extend(singletons[:remaining])
+        elif len(tier_selected) < min_singletons_per_tier:
+            tier_selected.extend(singletons[: max(0, min_singletons_per_tier - len(tier_selected))])
+            tier_selected = tier_selected[:max_per_tier]
+
+        selected.extend(tier_selected)
+
+    logger.info(
+        "Digest cluster selection: %d -> %d clusters (max_per_tier=%d)",
+        len(clusters), len(selected), max_per_tier,
+    )
+    return selected
 
 
 def _make_cluster(cluster_id: int, articles: list[Article]) -> StoryCluster:
@@ -114,21 +163,34 @@ def _make_cluster(cluster_id: int, articles: list[Article]) -> StoryCluster:
 
 
 def _geo_compatible(left: Article, right: Article) -> bool:
-    return left.geo_tier == right.geo_tier or "national" in {left.geo_tier, right.geo_tier}
+    return left.geo_tier == right.geo_tier
 
 
 def _similarity(left: Article, right: Article) -> float:
     left_text = f"{left.headline} {left.summary}".lower()
     right_text = f"{right.headline} {right.summary}".lower()
-    seq = SequenceMatcher(None, left_text, right_text).ratio()
+    headline_seq = SequenceMatcher(None, left.headline.lower(), right.headline.lower()).ratio()
     left_tokens = _tokens(left_text)
     right_tokens = _tokens(right_text)
     if not left_tokens or not right_tokens:
-        return seq
+        return headline_seq
+    shared = left_tokens & right_tokens
+    if len(shared) < 2:
+        return 0.0
     jaccard = len(left_tokens & right_tokens) / len(left_tokens | right_tokens)
-    return max(seq, jaccard)
+    return max(jaccard, headline_seq * 0.8)
 
 
 def _tokens(text: str) -> set[str]:
-    stop = {"the", "a", "an", "to", "of", "and", "in", "on", "for", "with", "new"}
-    return {t for t in text.replace("-", " ").split() if len(t) > 2 and t not in stop}
+    stop = {
+        "the", "a", "an", "to", "of", "and", "in", "on", "for", "with", "new",
+        "news", "says", "said", "after", "from", "over", "this", "that", "will",
+        "has", "have", "are", "was", "were", "into", "about", "latest", "live",
+    }
+    cleaned = "".join(ch if ch.isalnum() else " " for ch in text)
+    return {t for t in cleaned.split() if len(t) > 2 and t not in stop}
+
+
+def _selection_key(cluster: StoryCluster) -> tuple[float, int, int]:
+    corroboration_boost = 1 if not cluster.is_single_source else 0
+    return (cluster.importance_score, corroboration_boost, len(cluster.articles))

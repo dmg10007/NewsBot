@@ -140,10 +140,15 @@ clustering:
     local: 24
 
   # Singleton clusters (1 article) with importance_score below this value
-  # are dropped after clustering. Singletons are almost always wire stubs,
-  # opinion pieces, or hyper-local one-offs with no corroboration value.
-  # Set to 0.0 to disable and keep all singletons.
-  drop_singletons_below_importance: 0.4
+  # are dropped before digest selection. The durable pipeline then applies
+  # a per-geography cap so useful single-source local/state/national stories
+  # can still appear without flooding the email.
+  drop_singletons_below_importance: 0.1
+
+  # Minimum singleton score eligible for digest selection. The scorer applies
+  # a 0.1 floor, so this keeps legitimate one-source stories available while
+  # max_stories_per_category still caps email volume.
+  singleton_digest_floor: 0.1
 
   min_sources_to_report: 2
   cross_tier_boost: true

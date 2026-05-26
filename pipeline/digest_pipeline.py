@@ -20,7 +20,12 @@ from ingestion.scraper import SCRAPER_REGISTRY
 from llm_clients import ComparisonLLMClient, SummaryLLMClient
 from sources import load_sources_from_config
 from storage import SQLiteStore
-from story_clustering import StoryClusterer, filter_reportable_clusters, score_clusters
+from story_clustering import (
+    StoryClusterer,
+    filter_reportable_clusters,
+    score_clusters,
+    select_digest_clusters,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -91,6 +96,7 @@ class DigestPipeline:
             ).cluster(articles)
             score_clusters(clusters, self.settings)
             clusters = filter_reportable_clusters(clusters, self.settings)
+            clusters = select_digest_clusters(clusters, self.settings)
             clusters.sort(key=lambda c: c.importance_score, reverse=True)
 
             for cluster in clusters:
