@@ -7,6 +7,9 @@ app:
   timezone: America/New_York
   log_level: INFO
 
+storage:
+  sqlite_path: data/newsbot.sqlite
+
 schedule:
   morning_digest:
     hour: 6
@@ -27,10 +30,15 @@ topics:
     max_stories: 5
 
 geography:
+  profile: nc_lee_county
   national: true
   state: north_carolina
   local: lee_county_nc
   local_boost: 1.5
+  labels:
+    national: "National"
+    state: "North Carolina"
+    local: "Local - Lee County"
 
 # Story-level geo classification (replaces source-level region as primary signal)
 # Keywords lists are case-insensitive substring matches (word-boundary for tokens <= 3 chars)
@@ -132,10 +140,15 @@ clustering:
     local: 24
 
   # Singleton clusters (1 article) with importance_score below this value
-  # are dropped after clustering. Singletons are almost always wire stubs,
-  # opinion pieces, or hyper-local one-offs with no corroboration value.
-  # Set to 0.0 to disable and keep all singletons.
-  drop_singletons_below_importance: 0.4
+  # are dropped before digest selection. The durable pipeline then applies
+  # a per-geography cap so useful single-source local/state/national stories
+  # can still appear without flooding the email.
+  drop_singletons_below_importance: 0.1
+
+  # Minimum singleton score eligible for digest selection. The scorer applies
+  # a 0.1 floor, so this keeps legitimate one-source stories available while
+  # max_stories_per_category still caps email volume.
+  singleton_digest_floor: 0.1
 
   min_sources_to_report: 2
   cross_tier_boost: true

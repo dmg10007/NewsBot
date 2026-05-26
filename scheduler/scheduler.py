@@ -46,7 +46,6 @@ downstream observability. See parsing/geo_filter.py for tuning details.
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timezone
 
 from apscheduler.schedulers.blocking import BlockingScheduler
 from apscheduler.triggers.cron import CronTrigger
@@ -68,54 +67,8 @@ from summarizer.summarizer import Summarizer
 logger = logging.getLogger(__name__)
 
 
-def _validate_imports() -> None:
-    """Verify all pipeline modules are importable at scheduler startup.
-
-    Called once by start_scheduler() so that a broken module raises
-    ImportError immediately — not silently at the first scheduled run.
-    All imports are already at module level; this function exists as an
-    explicit fast-fail contract and documents which modules are required.
-    """
-    settings = get_settings()
-    if not settings.get("scheduler"):
-        raise RuntimeError("settings.yaml is missing the [scheduler] section")
-    logger.info("Import validation passed. Scheduler ready.")
-
-
-def _send_failure_alert(period: str, exc: Exception) -> None:
-    """Best-effort failure alert via Telegram.
-
-    EmailSender is intentionally excluded here: it requires a fully-rendered
-    HTML digest and a valid period label — it is not a general-purpose alert
-    channel. TelegramSender.send_alert() accepts a plain-text string and is
-    the correct delivery path for operational alerts.
-
-    Swallows any exception raised by the delivery layer so it never masks
-    the original error that triggered the alert.
-    """
-    message = (
-        f"NewsBot digest FAILED\n"
-        f"Period: {period}\n"
-        f"Time: {datetime.now(timezone.utc).isoformat()}\n"
-        f"Error: {type(exc).__name__}: {exc}"
-    )
-    try:
-        TelegramSender().send_alert(message)
-        logger.info("Failure alert sent via Telegram")
-    except Exception as telegram_exc:
-        logger.warning("Telegram alert failed: %s", telegram_exc)
-
-
 def run_digest(period: str = "morning") -> None:
-    """Execute one full digest pipeline run for the given period.
-
-    Args:
-        period: One of 'morning', 'afternoon', 'evening'. Controls which
-                delivery targets are active per settings.yaml.
-
-    Raises:
-        Re-raises any unhandled exception after sending a failure alert.
-    """
+    pipeline = DigestPipeline()
     try:
         _run_digest_inner(period)
     except Exception as exc:
@@ -180,45 +133,13 @@ def _run_digest_inner(period: str) -> None:
                 cluster, framing_results[cluster.cluster_id]
             )
     finally:
-        llm_analyzer.close()
-
-    # Stage 6: Summarize (context manager ensures httpx clients are released)
-    with Summarizer() as summarizer:
-        summaries = summarizer.summarize_all(clusters)
-
-    # Attach bias notes from LLM results
-    for s in summaries:
-        llm = llm_results.get(s.cluster_id)
-        if llm:
-            s.bias_notes = llm.bias_notes
-
-    # Stage 7: Deliver
-    delivery_settings = settings["delivery"].get(period, {})
-    if delivery_settings.get("telegram", {}).get("enabled"):
-        TelegramSender().send_digest(summaries, period=period)
-    if delivery_settings.get("email", {}).get("enabled"):
-        # EmailSender.send() requires rendered HTML — it does not accept
-        # summaries directly. EmailRenderer.render() must be called first.
-        html = EmailRenderer().render(summaries, period=period)
-        EmailSender().send(html, period=period, run_date=start_time)
-
-    elapsed = (datetime.now(timezone.utc) - start_time).total_seconds()
-    logger.info("Digest complete in %.1fs — %d stories delivered", elapsed, len(summaries))
-    record_run(period=period, story_count=len(summaries), elapsed_seconds=elapsed)
+        pipeline.close()
 
 
 def start_scheduler() -> None:
-    """Start the blocking APScheduler with cron triggers from settings.yaml.
-
-    Calls _validate_imports() first to fail fast if any pipeline module is
-    broken or misconfigured.
-    """
-    _validate_imports()
     settings = get_settings()
-    scheduler = BlockingScheduler(timezone="America/New_York")
-
-    schedule = settings["scheduler"]["schedule"]
-    for period, cron_expr in schedule.items():
+    scheduler = BlockingScheduler(timezone=settings.get("app", {}).get("timezone", "America/New_York"))
+    for period, cron_expr in settings["scheduler"]["schedule"].items():
         scheduler.add_job(
             run_digest,
             trigger=CronTrigger.from_crontab(cron_expr),
@@ -229,9 +150,4 @@ def start_scheduler() -> None:
             coalesce=True,
         )
         logger.info("Scheduled %s digest: %s", period, cron_expr)
-
-    logger.info("Scheduler starting. Press Ctrl+C to stop.")
-    try:
-        scheduler.start()
-    except KeyboardInterrupt:
-        logger.info("Scheduler stopped by user")
+    scheduler.start()

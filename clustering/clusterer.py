@@ -162,6 +162,11 @@ class StoryCluster:
         return len(self.articles) == 1
 
     @property
+    def is_single_source(self) -> bool:
+        """Compatibility alias used by older tests/renderers."""
+        return len({a.raw.source_name for a in self.articles}) <= 1
+
+    @property
     def has_cross_source_coverage(self) -> bool:
         return len({a.raw.source_name for a in self.articles}) > 1
 
@@ -249,13 +254,9 @@ class StoryClusterer:
             for cid, members in cluster_map.items()
         ]
 
-        before_filter = len(clusters)
-        clusters = [
-            c for c in clusters
-            if not c.is_singleton
-            or c.importance_score >= self._drop_singleton_threshold
-        ]
-        dropped = before_filter - len(clusters)
+        # Score-dependent singleton filtering now belongs to the digest
+        # orchestrator after score_clusters() has populated importance_score.
+        dropped = 0
 
         self._log_quality(articles, clusters, dropped)
         return clusters
@@ -294,7 +295,7 @@ class StoryClusterer:
 
     def _make_cluster(self, cid: int, members: list[ParsedArticle]) -> StoryCluster:
         topic = self._dominant_topic(members)
-        tiers = list({self._tier(a.raw.region) for a in members})
+        tiers = list({self._tier(a.raw.geo_tier or a.raw.region) for a in members})
         return StoryCluster(
             cluster_id=cid,
             articles=members,

@@ -18,7 +18,7 @@ import os
 from datetime import datetime
 from typing import Literal
 
-from summarizer.summarizer import SummarizedCluster
+from domain.models import DigestStory
 
 logger = logging.getLogger(__name__)
 
@@ -37,7 +37,7 @@ class TelegramSender:
         self._chat_id = os.getenv("NEWSBOT_TELEGRAM_CHAT_ID", "")
         self._enabled = bool(self._token and self._chat_id)
 
-    def send_digest(self, summaries: list[SummarizedCluster], period: str) -> bool:
+    def send_digest(self, summaries: list[DigestStory], period: str) -> bool:
         """Send a full digest as chunked Telegram messages."""
         return self._send(summaries, period=period, run_date=datetime.now())
 
@@ -64,7 +64,7 @@ class TelegramSender:
         except Exception as exc:
             logger.error("Telegram alert failed: %s", exc)
 
-    def _send(self, summaries: list[SummarizedCluster], period: str, run_date: datetime) -> bool:
+    def _send(self, summaries: list[DigestStory], period: str, run_date: datetime) -> bool:
         if not self._enabled:
             logger.debug("Telegram delivery is disabled or unconfigured. Skipping.")
             return False
@@ -100,14 +100,14 @@ class TelegramSender:
 
     def _build_messages(
         self,
-        summaries: list[SummarizedCluster],
+        summaries: list[DigestStory],
         period_label: str,
         date_str: str,
     ) -> list[str]:
         header = f"<b>NewsBot {period_label} Briefing</b> \u2014 {date_str}\n"
-        grouped: dict[str, list[SummarizedCluster]] = {t: [] for t in TOPIC_ORDER}
+        grouped: dict[str, list[DigestStory]] = {t: [] for t in TOPIC_ORDER}
         for s in summaries:
-            topic = s.tiers[0] if s.tiers else "current_events"
+            topic = s.topic or "current_events"
             bucket = topic if topic in grouped else "current_events"
             grouped[bucket].append(s)
 

@@ -37,6 +37,7 @@ import feedparser
 import httpx
 
 from config.loader import get_settings, get_sources
+from domain.models import ArticleDraft, Source, canonical_url_hash, normalize_article_url
 
 logger = logging.getLogger(__name__)
 
@@ -134,7 +135,6 @@ class RawArticle:
     The NLP pipeline (parsing/extractor.py) enriches these into ParsedArticle.
     """
     source_name: str
-    source_url: str
     headline: str
     url: str
     url_hash: str
@@ -146,6 +146,16 @@ class RawArticle:
     bias_metadata: Optional[object] = None
     tags: list[str] = field(default_factory=list)
     geo_tier: Optional[str] = None
+
+    def __post_init__(self) -> None:
+        if not self.source_url:
+            self.source_url = self.url
+        if not self.url_hash:
+            self.url_hash = canonical_url_hash(self.url)
+
+    @property
+    def canonical_url(self) -> str:
+        return normalize_article_url(self.url)
 
 
 class FeedFetcher:
@@ -201,9 +211,10 @@ class FeedFetcher:
                 continue
 
             published_at: Optional[datetime] = None
-            if entry.get("published_parsed"):
+            published_parsed = entry.get("published_parsed")
+            if published_parsed:
                 try:
-                    published_at = datetime(*entry.published_parsed[:6])
+                    published_at = datetime(*published_parsed[:6])
                 except (TypeError, ValueError):
                     pass
 
@@ -222,7 +233,7 @@ class FeedFetcher:
                 source_url=url,
                 headline=headline,
                 url=article_url,
-                url_hash=hashlib.sha256(article_url.encode()).hexdigest(),
+                url_hash=canonical_url_hash(article_url),
                 published_at=published_at,
                 summary=clean_summary,
                 region=source.get("region", "national"),
@@ -238,6 +249,41 @@ class FeedFetcher:
             )
         time.sleep(self._delay)
         return articles
+
+    def fetch_all(self, sources: list[dict]) -> list[RawArticle]:
+        """Fetch all RSS sources.
+
+        Kept for older tests and callers; the refactored pipeline calls
+        `fetch()` per typed source so it can record source health precisely.
+        """
+        articles: list[RawArticle] = []
+        for source in sources:
+            try:
+                articles.extend(self.fetch(source))
+            except Exception as exc:
+                logger.warning("Failed to fetch source %s: %s", source.get("name"), exc)
+        return articles
+
+    def fetch_source(self, source: Source) -> list[ArticleDraft]:
+        """Fetch one typed Source and return normalized article drafts."""
+        raw_articles = self.fetch({
+            "name": source.name,
+            "url": source.url,
+            "region": source.region,
+            "bias_lean": source.bias_lean,
+            "credibility": source.credibility,
+        })
+        return [
+            ArticleDraft(
+                source=source,
+                headline=a.headline,
+                url=a.url,
+                summary=a.summary,
+                published_at=a.published_at,
+                tags=a.tags,
+            )
+            for a in raw_articles
+        ]
 
     def close(self) -> None:
         self._client.close()

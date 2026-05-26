@@ -35,10 +35,22 @@ from bias.source_ratings import (
     SourceRating,
     _BROWSER_HEADERS,
     _OUTLET_DOMAIN_MAP,
+    scrape_allsides as _scrape_allsides,
+    scrape_mbfc_bulk as _scrape_mbfc_bulk,
     scrape_all,
 )
 
 logger = logging.getLogger(__name__)
+
+
+def scrape_allsides(client: httpx.Client) -> dict[str, str]:
+    """Compatibility wrapper for tests and callers that patch this symbol."""
+    return _scrape_allsides(client)
+
+
+def scrape_mbfc_bulk(client: httpx.Client, domains: list[str], delay: float = 1.5) -> dict[str, dict]:
+    """Compatibility wrapper for tests and callers that patch this symbol."""
+    return _scrape_mbfc_bulk(client, domains, delay)
 
 _FALLBACK_RATINGS: dict[str, dict] = {
     "apnews.com":            {"bias_lean": "center",       "factuality": "very-high"},
@@ -102,7 +114,8 @@ class BiasResolver:
             follow_redirects=True,
         )
         try:
-            allsides_result, mbfc_result = scrape_all(client, known_domains, delay=1.5)
+            allsides_result = scrape_allsides(client)
+            mbfc_result = scrape_mbfc_bulk(client, known_domains, delay=1.5)
         finally:
             client.close()
 
