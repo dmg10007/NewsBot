@@ -31,6 +31,83 @@ The main orchestrator is `pipeline.DigestPipeline`. Scheduler and CLI commands a
 
 SQLite persistence is implemented in `storage.SQLiteStore` and defaults to `data/newsbot.sqlite`.
 
+## Installation
+
+NewsBot requires Python 3.11 or newer.
+
+Create and activate a virtual environment:
+
+```bash
+python -m venv .venv
+.venv\Scripts\activate
+```
+
+Install dependencies:
+
+```bash
+python -m pip install --upgrade pip
+pip install -r requirements.txt
+python -m spacy download en_core_web_sm
+```
+
+If you plan to refresh live media-bias ratings with Playwright-backed scrapers, install the browser runtime:
+
+```bash
+python -m playwright install chromium
+```
+
+Create your local environment file:
+
+```bash
+copy .env.example .env
+```
+
+Then edit `.env` with at least the email variables if you want delivery enabled.
+
+Initialize the SQLite database:
+
+```bash
+python main.py db migrate
+```
+
+Validate source configuration:
+
+```bash
+python main.py sources check
+```
+
+Run a non-delivery ingestion smoke test:
+
+```bash
+python main.py ingest --dry-run
+```
+
+## Startup
+
+Run one digest immediately:
+
+```bash
+python main.py run --period morning
+python main.py run --period evening
+```
+
+Start the blocking scheduler:
+
+```bash
+python main.py schedule
+```
+
+By default, scheduled runs use the cron expressions in `config/settings.yaml`:
+
+```yaml
+scheduler:
+  schedule:
+    morning: "0 6 * * *"
+    evening: "0 18 * * *"
+```
+
+For a persistent deployment, run `python main.py schedule` under your normal process manager, such as Task Scheduler on Windows, systemd on Linux, or a container supervisor.
+
 ## Commands
 
 ```bash
@@ -109,6 +186,8 @@ LLAMA_CPP_MODEL=llama3
 NEWSBOT_TELEGRAM_TOKEN=
 NEWSBOT_TELEGRAM_CHAT_ID=
 ```
+
+If email delivery is enabled in `config/settings.yaml`, the `RESEND_API_KEY`, `NEWSBOT_EMAIL_FROM`, and `NEWSBOT_EMAIL_TO` variables must be present. If you only want to test ingestion and rendering, keep delivery disabled or use `python main.py ingest --dry-run`.
 
 ## Tests
 
