@@ -137,8 +137,9 @@ class RawArticle:
     source_name: str
     headline: str
     url: str
-    url_hash: str
-    published_at: Optional[datetime]
+    source_url: str = ""
+    url_hash: str = ""
+    published_at: Optional[datetime] = None
     summary: str = ""       # Plain text — HTML stripped at ingest time
     region: str = "national"
     bias_lean: str = "unknown"
