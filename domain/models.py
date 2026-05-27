@@ -71,6 +71,16 @@ def canonical_url_hash(url: str) -> str:
     return hashlib.sha256(normalize_article_url(url).encode()).hexdigest()
 
 
+def _extract_domain(url: str) -> str:
+    """Return the bare hostname of *url*, stripped of 'www.' prefix.
+
+    Used as a fallback publisher identity when Source.publisher is not set.
+    For example, 'https://apnews.com/hub/politics' -> 'apnews.com'.
+    """
+    host = urlparse(url).netloc.lower()
+    return host.removeprefix("www.")
+
+
 @dataclass(frozen=True)
 class Source:
     name: str
@@ -84,6 +94,9 @@ class Source:
     scraper_class: Optional[str] = None
     rss_url: Optional[str] = None
     selectors: dict = field(default_factory=dict)
+    publisher: str = ""  # Outlet identity (e.g. "ap", "reuters"). Distinct from
+                         # feed name so multiple category feeds from the same
+                         # outlet are counted as one source during clustering.
 
 
 @dataclass
@@ -126,6 +139,9 @@ class Article:
     tags: list[str] = field(default_factory=list)
     fetch_status: str = "ok"
     bias_metadata: Optional[object] = None
+    publisher_name: str = ""  # Resolved outlet identity used for source_count
+                              # deduplication. Set from Source.publisher, or
+                              # falls back to the domain of source_url.
 
     @classmethod
     def from_draft(
@@ -155,6 +171,7 @@ class Article:
             credibility=source.credibility,
             topics=list(source.topics),
             tags=list(draft.tags),
+            publisher_name=source.publisher or _extract_domain(source.url),
         )
 
 
@@ -177,7 +194,10 @@ class StoryCluster:
 
     @property
     def source_count(self) -> int:
-        return len({a.source_name for a in self.articles})
+        # Deduplicate by publisher_name (outlet identity) rather than
+        # source_name (feed name) so that "AP Top News" and "AP Politics"
+        # are counted as a single source, not two.
+        return len({a.publisher_name or a.source_name for a in self.articles})
 
     @property
     def is_single_source(self) -> bool:
