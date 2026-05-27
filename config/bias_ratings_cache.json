@@ -1,0 +1,213 @@
+{
+  "generated_at": "2026-05-25T03:22:00.245636+00:00",
+  "source_count": 19,
+  "ratings": {
+    "ncpolicywatch.com": {
+      "bias_lean": "center-left",
+      "factuality": "mostly-factual",
+      "confidence": 0.5,
+      "allsides_bias": null,
+      "mbfc_bias": null,
+      "mbfc_factuality": null,
+      "notes": [
+        "fallback only"
+      ]
+    },
+    "wral.com": {
+      "bias_lean": "center",
+      "factuality": "high",
+      "confidence": 0.5,
+      "allsides_bias": null,
+      "mbfc_bias": null,
+      "mbfc_factuality": null,
+      "notes": [
+        "fallback only"
+      ]
+    },
+    "rantnc.com": {
+      "bias_lean": "center-right",
+      "factuality": "high",
+      "confidence": 0.75,
+      "allsides_bias": null,
+      "mbfc_bias": "center-right",
+      "mbfc_factuality": "high",
+      "notes": [
+        "mbfc only"
+      ]
+    },
+    "npr.org": {
+      "bias_lean": "center-left",
+      "factuality": "high",
+      "confidence": 0.5,
+      "allsides_bias": null,
+      "mbfc_bias": null,
+      "mbfc_factuality": null,
+      "notes": [
+        "fallback only"
+      ]
+    },
+    "sanfordherald.com": {
+      "bias_lean": "center-right",
+      "factuality": "high",
+      "confidence": 0.75,
+      "allsides_bias": null,
+      "mbfc_bias": "center-right",
+      "mbfc_factuality": "high",
+      "notes": [
+        "mbfc only"
+      ]
+    },
+    "thehill.com": {
+      "bias_lean": "center",
+      "factuality": "mostly-factual",
+      "confidence": 0.75,
+      "allsides_bias": null,
+      "mbfc_bias": "center",
+      "mbfc_factuality": "mostly-factual",
+      "notes": [
+        "mbfc only"
+      ]
+    },
+    "wsj.com": {
+      "bias_lean": "center-right",
+      "factuality": "high",
+      "confidence": 0.5,
+      "allsides_bias": null,
+      "mbfc_bias": null,
+      "mbfc_factuality": null,
+      "notes": [
+        "fallback only"
+      ]
+    },
+    "axios.com": {
+      "bias_lean": "center-left",
+      "factuality": "high",
+      "confidence": 0.75,
+      "allsides_bias": "center-left",
+      "mbfc_bias": null,
+      "mbfc_factuality": null,
+      "notes": [
+        "allsides only"
+      ]
+    },
+    "carolinapublicpress.org": {
+      "bias_lean": "center",
+      "factuality": "high",
+      "confidence": 0.5,
+      "allsides_bias": null,
+      "mbfc_bias": null,
+      "mbfc_factuality": null,
+      "notes": [
+        "fallback only"
+      ]
+    },
+    "charlotteobserver.com": {
+      "bias_lean": "center-left",
+      "factuality": "high",
+      "confidence": 0.5,
+      "allsides_bias": null,
+      "mbfc_bias": null,
+      "mbfc_factuality": null,
+      "notes": [
+        "fallback only"
+      ]
+    },
+    "buzzfeednews.com": {
+      "bias_lean": "left",
+      "factuality": "mostly-factual",
+      "confidence": 0.75,
+      "allsides_bias": "left",
+      "mbfc_bias": null,
+      "mbfc_factuality": null,
+      "notes": [
+        "allsides only"
+      ]
+    },
+    "foxbusiness.com": {
+      "bias_lean": "center-right",
+      "factuality": "mostly-factual",
+      "confidence": 0.75,
+      "allsides_bias": "center-right",
+      "mbfc_bias": null,
+      "mbfc_factuality": null,
+      "notes": [
+        "allsides only"
+      ]
+    },
+    "reuters.com": {
+      "bias_lean": "center",
+      "factuality": "very-high",
+      "confidence": 0.75,
+      "allsides_bias": null,
+      "mbfc_bias": "center",
+      "mbfc_factuality": "very-high",
+      "notes": [
+        "mbfc only"
+      ]
+    },
+    "wcnc.com": {
+      "bias_lean": "center",
+      "factuality": "high",
+      "confidence": 0.75,
+      "allsides_bias": null,
+      "mbfc_bias": "center",
+      "mbfc_factuality": "high",
+      "notes": [
+        "mbfc only"
+      ]
+    },
+    "apnews.com": {
+      "bias_lean": "center-left",
+      "factuality": "high",
+      "confidence": 1.0,
+      "allsides_bias": "center-left",
+      "mbfc_bias": "center-left",
+      "mbfc_factuality": "high",
+      "notes": []
+    },
+    "motherjones.com": {
+      "bias_lean": "left",
+      "factuality": "mostly-factual",
+      "confidence": 0.75,
+      "allsides_bias": "left",
+      "mbfc_bias": null,
+      "mbfc_factuality": null,
+      "notes": [
+        "allsides only"
+      ]
+    },
+    "cnn.com": {
+      "bias_lean": "center-left",
+      "factuality": "very-low",
+      "confidence": 0.5,
+      "allsides_bias": null,
+      "mbfc_bias": null,
+      "mbfc_factuality": "very-low",
+      "notes": [
+        "fallback only"
+      ]
+    },
+    "foxnews.com": {
+      "bias_lean": "right",
+      "factuality": "mixed",
+      "confidence": 0.5,
+      "allsides_bias": null,
+      "mbfc_bias": null,
+      "mbfc_factuality": null,
+      "notes": [
+        "fallback only"
+      ]
+    },
+    "pbs.org": {
+      "bias_lean": "center-left",
+      "factuality": "high",
+      "confidence": 0.5,
+      "allsides_bias": null,
+      "mbfc_bias": null,
+      "mbfc_factuality": null,
+      "notes": [
+        "fallback only"
+      ]
+    }
+  }
+}
