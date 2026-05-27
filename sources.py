@@ -42,4 +42,5 @@ def _source_from_dict(item: Mapping, *, tier: str, source_type: str) -> Source:
         scraper_class=item.get("scraper_class"),
         rss_url=item.get("rss_url"),
         selectors=dict(item.get("selectors", {})),
+        publisher=item.get("publisher", ""),
     )

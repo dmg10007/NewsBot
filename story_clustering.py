@@ -28,6 +28,23 @@ class StoryClusterer:
     def cluster(self, articles: list[Article]) -> list[StoryCluster]:
         if not articles:
             return []
+
+        # Deduplicate by canonical URL hash before clustering.
+        # The same physical article can be ingested from multiple category
+        # feeds (e.g. "AP Top News" and "AP Politics"). Dropping duplicates
+        # here ensures each article enters the union-find exactly once and
+        # cannot inflate cluster.source_count or article counts.
+        seen_hashes: set[str] = set()
+        unique_articles: list[Article] = []
+        for article in articles:
+            if article.url_hash not in seen_hashes:
+                seen_hashes.add(article.url_hash)
+                unique_articles.append(article)
+        dropped = len(articles) - len(unique_articles)
+        if dropped:
+            logger.debug("url_hash dedup: dropped %d duplicate article(s) before clustering", dropped)
+        articles = unique_articles
+
         parent = list(range(len(articles)))
 
         def find(x: int) -> int:
