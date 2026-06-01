@@ -190,11 +190,15 @@ class DigestPipeline:
 
     def _enrich_bias(self, articles: list[Article]) -> None:
         for article in articles:
+            # Source config already sets a known bias_lean for all configured
+            # sources. Only attempt live resolution for unknown/unset values.
+            if article.bias_lean and article.bias_lean != "unknown":
+                continue
             domain = urlparse(article.canonical_url).netloc
-            if not domain:
+            if not domain or domain == "news.google.com":
                 continue
             rating = self.bias_resolver.resolve(domain, credibility=article.credibility)
-            article.bias_lean = rating.bias_lean or article.bias_lean or "unknown"
+            article.bias_lean = rating.bias_lean or "unknown"
             article.bias_metadata = rating
 
     def _suppress_recent_articles(self, articles: list[Article], period: str) -> list[Article]:
