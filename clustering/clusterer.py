@@ -64,6 +64,7 @@ import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Optional, Union
+from urllib.parse import urlparse
 
 import numpy as np
 from sentence_transformers import util
@@ -85,6 +86,39 @@ def _to_utc(dt: datetime) -> datetime:
     if dt.tzinfo is None:
         return dt.replace(tzinfo=timezone.utc)
     return dt.astimezone(timezone.utc)
+
+
+def _publisher(article: ParsedArticle) -> str:
+    """Return the canonical publisher identity for an article.
+
+    Priority order:
+      1. article.raw.publisher — explicitly set in sources.yaml (most reliable)
+      2. netloc of article.raw.url — derived from the article's own URL
+      3. article.raw.source_name — feed name fallback (least reliable; splits
+         same outlet across topic-scoped feeds)
+
+    Using the article URL domain rather than the feed URL domain is important
+    for Google News proxy feeds: the feed URL is news.google.com, but the
+    article URL resolves to apnews.com, reuters.com, etc.
+    """
+    # 1. Explicit publisher field from sources.yaml
+    publisher = getattr(article.raw, "publisher", "") or ""
+    if publisher:
+        return publisher.strip().lower()
+
+    # 2. Extract domain from the article's own URL
+    url = getattr(article.raw, "url", "") or ""
+    if url:
+        try:
+            host = urlparse(url).netloc.lower()
+            host = host.removeprefix("www.")
+            if host:
+                return host
+        except Exception:
+            pass
+
+    # 3. Feed name as last resort
+    return article.raw.source_name
 
 
 class UnionFind:
@@ -137,7 +171,11 @@ class StoryCluster:
     representative_headline: str = field(init=False)
 
     def __post_init__(self) -> None:
-        self.source_count = len(self.articles)
+        # Count distinct publishers, not raw article count. This prevents
+        # same-outlet multi-feed articles (e.g. 'AP News - Politics' and
+        # 'AP News - Economy') from inflating source_count and making a
+        # single-outlet cluster appear to have cross-source coverage.
+        self.source_count = len({_publisher(a) for a in self.articles})
         self.bias_spread = list({
             a.raw.bias_lean for a in self.articles if a.raw.bias_lean != "unknown"
         })
@@ -163,12 +201,13 @@ class StoryCluster:
 
     @property
     def is_single_source(self) -> bool:
-        """Compatibility alias used by older tests/renderers."""
-        return len({a.raw.source_name for a in self.articles}) <= 1
+        """True if all articles in this cluster share the same publisher."""
+        return self.source_count <= 1
 
     @property
     def has_cross_source_coverage(self) -> bool:
-        return len({a.raw.source_name for a in self.articles}) > 1
+        """True if this cluster contains articles from more than one publisher."""
+        return self.source_count > 1
 
     @property
     def has_cross_lean_coverage(self) -> bool:
@@ -212,6 +251,24 @@ class StoryClusterer:
     def cluster(self, articles: list[ParsedArticle]) -> list[StoryCluster]:
         if not articles:
             return []
+        if len(articles) == 1:
+            return [self._make_cluster(0, articles)]
+
+        # Deduplicate by URL before clustering so the same article ingested
+        # from multiple topic-scoped feeds (e.g. AP Top Headlines + AP Politics)
+        # is only embedded and compared once. This prevents a single article
+        # from appearing twice in a cluster and distorting similarity scores.
+        seen_urls: set[str] = set()
+        unique_articles: list[ParsedArticle] = []
+        for a in articles:
+            url = getattr(a.raw, "url", "") or ""
+            if url and url in seen_urls:
+                continue
+            if url:
+                seen_urls.add(url)
+            unique_articles.append(a)
+        articles = unique_articles
+
         if len(articles) == 1:
             return [self._make_cluster(0, articles)]
 

@@ -113,10 +113,12 @@ deduplication:
   headline_similarity_threshold: 0.95
   # Cross-source wire syndication threshold. Articles from DIFFERENT outlets
   # with similarity >= this value are treated as wire copy (AP/Reuters
-  # republication) and collapsed. Must be higher than
-  # headline_similarity_threshold to avoid collapsing legitimately similar
-  # but independently written stories. Only reduce below 0.90 with caution.
-  wire_syndication_threshold: 0.95
+  # republication) and collapsed. Raised from 0.95 to 0.99 to stop
+  # aggressively collapsing cross-source coverage before clustering.
+  # At 0.95, Reuters and NPR independently covering the same story could
+  # be deduplicated into one article, guaranteeing a single-source cluster.
+  # 0.99 retains only true byte-for-byte republications.
+  wire_syndication_threshold: 0.99
 
 clustering:
   model: all-MiniLM-L6-v2
