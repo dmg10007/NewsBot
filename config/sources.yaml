@@ -14,10 +14,17 @@
 # Geo scoping: Reuters and AP Google News proxies now include 'united states'
 # query constraint to prevent pure international wire content from filling
 # national slots. Topic-specific feeds retain their topic constraint + US scope.
+#
+# publisher: field — canonical outlet identity used by StoryCluster._publisher()
+# to count distinct sources. Feed-name-based counting (the old behaviour) treated
+# 'AP News - Politics' and 'AP News - Economy' as separate sources, inflating
+# source_count. With publisher: set, all AP feeds collapse to 'ap' and all
+# Reuters feeds collapse to 'reuters', giving accurate cross-outlet counts.
 
 national:
   rss:
     - name: AP News - Top Headlines
+      publisher: ap
       url: https://news.google.com/rss/search?q=when:24h+allinurl:apnews.com+"united+states"&hl=en-US&gl=US&ceid=US:en
       bias_lean: center
       credibility: high
@@ -25,6 +32,7 @@ national:
       note: "AP News has no public RSS; proxied via Google News allinurl filter + US scope"
 
     - name: AP News - Politics
+      publisher: ap
       url: https://news.google.com/rss/search?q=when:24h+allinurl:apnews.com+politics+"united+states"&hl=en-US&gl=US&ceid=US:en
       bias_lean: center
       credibility: high
@@ -32,6 +40,7 @@ national:
       note: "Google News proxy + US scope"
 
     - name: AP News - Economy
+      publisher: ap
       url: https://news.google.com/rss/search?q=when:24h+allinurl:apnews.com+business+economy+"united+states"&hl=en-US&gl=US&ceid=US:en
       bias_lean: center
       credibility: high
@@ -39,6 +48,7 @@ national:
       note: "Google News proxy + US scope"
 
     - name: Reuters - Top News
+      publisher: reuters
       url: https://news.google.com/rss/search?q=site:reuters.com+"united+states"&hl=en-US&gl=US&ceid=US:en
       bias_lean: center
       credibility: high
@@ -46,6 +56,7 @@ national:
       note: "Reuters dropped public RSS in 2020; proxied via Google News + US scope"
 
     - name: Reuters - Politics
+      publisher: reuters
       url: https://news.google.com/rss/search?q=site:reuters.com+politics+"united+states"&hl=en-US&gl=US&ceid=US:en
       bias_lean: center
       credibility: high
@@ -53,6 +64,7 @@ national:
       note: "Google News proxy + US scope"
 
     - name: Reuters - Economy
+      publisher: reuters
       url: https://news.google.com/rss/search?q=site:reuters.com+economy+business+"united+states"&hl=en-US&gl=US&ceid=US:en
       bias_lean: center
       credibility: high
@@ -60,24 +72,28 @@ national:
       note: "Google News proxy + US scope"
 
     - name: NPR News
+      publisher: npr
       url: https://feeds.npr.org/1001/rss.xml
       bias_lean: center-left
       credibility: high
       topics: [politics, economy, current_events]
 
     - name: NPR Politics
+      publisher: npr
       url: https://feeds.npr.org/1014/rss.xml
       bias_lean: center-left
       credibility: high
       topics: [politics]
 
     - name: PBS NewsHour
+      publisher: pbs
       url: https://www.pbs.org/newshour/feeds/rss/headlines
       bias_lean: center-left
       credibility: high
       topics: [politics, economy, current_events]
 
     - name: Axios
+      publisher: axios
       url: https://news.google.com/rss/search?q=site:axios.com&hl=en-US&gl=US&ceid=US:en
       bias_lean: center
       credibility: high
@@ -85,18 +101,21 @@ national:
       note: "Axios has no native RSS; proxied via Google News"
 
     - name: The Hill
+      publisher: thehill
       url: https://thehill.com/rss/syndicator/19110
       bias_lean: center
       credibility: medium
       topics: [politics, economy]
 
     - name: Fox News - Politics
+      publisher: foxnews
       url: https://moxie.foxnews.com/google-publisher/politics.xml
       bias_lean: right
       credibility: medium
       topics: [politics]
 
     - name: Fox News - Economy
+      publisher: foxnews
       url: https://feeds.foxbusiness.com/foxbusiness/latest
       bias_lean: right
       credibility: medium
@@ -104,12 +123,14 @@ national:
       note: "moxie.foxnews.com/google-publisher/business.xml deprecated; moved to foxbusiness feed"
 
     - name: CNN - Politics
+      publisher: cnn
       url: http://rss.cnn.com/rss/cnn_allpolitics.rss
       bias_lean: center-left
       credibility: medium
       topics: [politics]
 
     - name: Wall Street Journal - Economy
+      publisher: wsj
       url: https://news.google.com/rss/search?q=site:wsj.com+economy+business&hl=en-US&gl=US&ceid=US:en
       bias_lean: center-right
       credibility: high
@@ -120,6 +141,7 @@ state:
   # North Carolina
   rss:
     - name: WRAL News
+      publisher: wral
       url: http://www.wral.com/news/rss/48/
       bias_lean: center
       credibility: high
@@ -128,6 +150,7 @@ state:
       note: "Confirmed URL from wral.com/about/wral-rss-feeds/ (Top Stories)"
 
     - name: WRAL Politics
+      publisher: wral
       url: http://www.wral.com/news/rss/35/
       bias_lean: center
       credibility: high
@@ -136,6 +159,7 @@ state:
       note: "Confirmed URL from wral.com/about/wral-rss-feeds/ (Political News)"
 
     - name: NC Policy Watch
+      publisher: ncpolicywatch
       url: http://www.ncpolicywatch.com/feed/
       bias_lean: center-left
       credibility: medium
@@ -143,6 +167,7 @@ state:
       region: north_carolina
 
     - name: Carolina Public Press
+      publisher: carolinapublicpress
       url: https://carolinapublicpress.org/feed/
       bias_lean: center
       credibility: high
@@ -150,6 +175,7 @@ state:
       region: north_carolina
 
     - name: WCNC Charlotte
+      publisher: wcnc
       url: https://www.wcnc.com/feeds/syndication/rss/news
       bias_lean: center
       credibility: medium
@@ -158,6 +184,7 @@ state:
 
   scrapers:
     - name: Charlotte Observer
+      publisher: charlotteobserver
       url: https://www.charlotteobserver.com
       rss_url: https://news.google.com/rss/search?q=site:charlotteobserver.com&hl=en-US&gl=US&ceid=US:en
       bias_lean: center-left
@@ -171,6 +198,7 @@ local:
   # Lee County, NC
   scrapers:
     - name: Sanford Herald
+      publisher: sanfordherald
       url: https://www.sanfordherald.com
       bias_lean: center
       credibility: medium
@@ -185,6 +213,7 @@ local:
         date: "time.tnt-date"
 
     - name: The Rant NC
+      publisher: rantnc
       url: https://rantnc.com
       bias_lean: center
       credibility: medium
