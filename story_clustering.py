@@ -5,9 +5,11 @@ from __future__ import annotations
 import logging
 from collections import defaultdict
 from datetime import datetime, timezone
-from difflib import SequenceMatcher
 
 from domain.models import Article, StoryCluster
+from config.loader import get_settings
+from sentence_transformers import util as st_util
+from utils.model_registry import get_model
 
 logger = logging.getLogger(__name__)
 
@@ -15,14 +17,19 @@ logger = logging.getLogger(__name__)
 class StoryClusterer:
     """Cluster articles that appear to report the same news event.
 
-    This implementation keeps the dependency surface small for the durable
-    pipeline. It uses normalized headline/summary similarity and transitive
-    union so A-B and B-C matches produce one cluster. The old
-    sentence-transformer clusterer can still be tuned separately, but this
-    path is deterministic and easy to test.
+    Uses sentence-transformer cosine similarity (all-MiniLM-L6-v2) to match
+    articles semantically regardless of surface-form vocabulary differences.
+    The model is loaded once via utils.model_registry and reused across the
+    full pipeline run (Deduplicator warms it earlier in the same run).
+
+    The old Jaccard/SequenceMatcher approach returned 0.0 for most cross-outlet
+    same-story pairs because outlets use different vocabulary — e.g.
+    "Fed raises interest rates" vs "Federal Reserve hikes benchmark borrowing
+    costs" share zero tokens after stop-word removal. Semantic embeddings
+    capture meaning regardless of surface variation.
     """
 
-    def __init__(self, similarity_threshold: float = 0.58) -> None:
+    def __init__(self, similarity_threshold: float = 0.45) -> None:
         self.similarity_threshold = similarity_threshold
 
     def cluster(self, articles: list[Article]) -> list[StoryCluster]:
@@ -45,6 +52,23 @@ class StoryClusterer:
             logger.debug("url_hash dedup: dropped %d duplicate article(s) before clustering", dropped)
         articles = unique_articles
 
+        # Batch-encode all articles once and compute a full cosine similarity
+        # matrix. This replaces the old per-pair Jaccard/SequenceMatcher
+        # approach which returned 0.0 for most cross-outlet same-story pairs
+        # because they use different vocabulary (e.g. "Fed hikes rates" vs
+        # "Federal Reserve raises benchmark borrowing costs" share 0 tokens
+        # after stop-word removal). Semantic embeddings capture meaning
+        # regardless of surface-form variation.
+        #
+        # The model is already warm — Deduplicator loads it earlier in the
+        # same run via utils.model_registry, so get_model() is a cache hit.
+        _cfg = get_settings().get("clustering", {})
+        _model = get_model(_cfg.get("model", "all-MiniLM-L6-v2"))
+        _texts = [f"{a.headline}. {a.summary}"[:500] for a in articles]
+        logger.info("Encoding %d articles for story clustering...", len(_texts))
+        _embeddings = _model.encode(_texts, convert_to_tensor=True, show_progress_bar=False)
+        _cosine_scores = st_util.cos_sim(_embeddings, _embeddings)
+
         parent = list(range(len(articles)))
 
         def find(x: int) -> int:
@@ -61,7 +85,7 @@ class StoryClusterer:
         for i, left in enumerate(articles):
             for j in range(i + 1, len(articles)):
                 right = articles[j]
-                if _geo_compatible(left, right) and _similarity(left, right) >= self.similarity_threshold:
+                if _geo_compatible(left, right) and float(_cosine_scores[i][j]) >= self.similarity_threshold:
                     union(i, j)
 
         grouped: dict[int, list[Article]] = defaultdict(list)
@@ -181,31 +205,6 @@ def _make_cluster(cluster_id: int, articles: list[Article]) -> StoryCluster:
 
 def _geo_compatible(left: Article, right: Article) -> bool:
     return left.geo_tier == right.geo_tier
-
-
-def _similarity(left: Article, right: Article) -> float:
-    left_text = f"{left.headline} {left.summary}".lower()
-    right_text = f"{right.headline} {right.summary}".lower()
-    headline_seq = SequenceMatcher(None, left.headline.lower(), right.headline.lower()).ratio()
-    left_tokens = _tokens(left_text)
-    right_tokens = _tokens(right_text)
-    if not left_tokens or not right_tokens:
-        return headline_seq
-    shared = left_tokens & right_tokens
-    if len(shared) < 2:
-        return 0.0
-    jaccard = len(left_tokens & right_tokens) / len(left_tokens | right_tokens)
-    return max(jaccard, headline_seq * 0.8)
-
-
-def _tokens(text: str) -> set[str]:
-    stop = {
-        "the", "a", "an", "to", "of", "and", "in", "on", "for", "with", "new",
-        "news", "says", "said", "after", "from", "over", "this", "that", "will",
-        "has", "have", "are", "was", "were", "into", "about", "latest", "live",
-    }
-    cleaned = "".join(ch if ch.isalnum() else " " for ch in text)
-    return {t for t in cleaned.split() if len(t) > 2 and t not in stop}
 
 
 def _selection_key(cluster: StoryCluster) -> tuple[float, int, int]:

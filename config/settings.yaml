@@ -123,13 +123,12 @@ deduplication:
 clustering:
   model: all-MiniLM-L6-v2
 
-  # Tuned down from 0.82 to 0.50.
-  # all-MiniLM-L6-v2 cosine scores for same-story articles across different
-  # sources typically land in the 0.45-0.65 range. The old value of 0.82
-  # was the primary cause of 289 clusters from 308 articles — nearly every
-  # article became a singleton because legitimate same-story pairs scored
-  # below the threshold. Start at 0.50 and dial up if over-merging occurs.
-  similarity_threshold: 0.50
+  # Lowered from 0.50 to 0.45.
+  # After switching from Jaccard/SequenceMatcher to sentence-transformer cosine
+  # similarity, 0.45 gives headroom for state and local tier stories where
+  # fewer outlets cover the same event and phrasing diverges more. Dial up
+  # toward 0.55 if over-merging is observed in practice.
+  similarity_threshold: 0.45
 
   # Per-tier age window. Articles must be published within this window to
   # be merged into the same cluster. National stories (slow-burn) get a
