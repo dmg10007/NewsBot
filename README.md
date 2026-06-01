@@ -1,4 +1,4 @@
-# NewsBot
+# NewsBot v0.0.3
 
 NewsBot builds a twice-daily national, state, and local news digest. It ingests configured RSS feeds and scraper sources, groups articles reporting the same story, compares reporting across sources, writes neutral summaries, links every source, and labels each source with its configured or resolved media-bias rating.
 
@@ -153,7 +153,7 @@ NewsBot keeps separate LLM clients:
 - `ComparisonLLMClient` compares reporting across clustered articles.
 - `SummaryLLMClient` writes neutral digest summaries.
 
-Both clients use Perplexity when `PPLX_API_KEY` is set, fall back to a local OpenAI-compatible llama.cpp server when `LLAMA_CPP_BASE_URL` is set, and finally fall back to deterministic heuristic/extractive output. Prompts explicitly treat “bias-free” as minimizing loaded language and clearly labeling attribution, not as a guarantee of perfect objectivity.
+Both clients use Perplexity when `PPLX_API_KEY` is set, fall back to a local OpenAI-compatible llama.cpp server when `LLAMA_CPP_BASE_URL` is set, and finally fall back to deterministic heuristic/extractive output. Prompts explicitly treat "bias-free" as minimizing loaded language and clearly labeling attribution, not as a guarantee of perfect objectivity.
 
 ## Delivery
 
@@ -196,3 +196,59 @@ pytest
 ```
 
 The test suite covers URL normalization, source/geography classification, clustering compatibility, SQLite persistence, email rendering, source-bias resolver behavior, ingestion compatibility, and monitoring.
+
+## Troubleshooting
+
+### No stories appear in the digest
+
+- Verify source URLs in `config/sources.yaml` are reachable and returning content.
+- Check that `lookback_hours` in `config/settings.yaml` is wide enough to capture recent articles.
+- Run `python main.py ingest --dry-run` and inspect the output for fetch errors.
+- Confirm geo filters are not excluding everything — check the geography keywords in `config/settings.yaml`.
+- Check the run history in `data/newsbot.sqlite` for error records from the last run.
+
+### Mostly single-source stories
+
+- Check your source list in `config/sources.yaml`. State and local tiers only have a handful of outlets; single-source stories there are expected.
+- Review clustering thresholds in `config/settings.yaml`. A threshold that is too high will prevent similar articles from merging.
+- Check whether `wire_syndication_threshold` is collapsing cross-source coverage before clustering runs. Raising this value to `0.99` or disabling it preserves legitimate cross-outlet corroboration.
+- Multiple feeds from the same publisher (e.g., AP Top News and AP Politics) count as one publisher once the `publisher:` field is populated in `config/sources.yaml`. If that field is missing, the same outlet's feeds inflate the apparent source count.
+- Geographic tier mismatches prevent clustering: a national article and a state article about the same event will not merge unless the clustering configuration allows cross-tier matching.
+
+### Email is not sending
+
+- Confirm `RESEND_API_KEY`, `NEWSBOT_EMAIL_FROM`, and `NEWSBOT_EMAIL_TO` are all set in `.env`.
+- Verify the delivery period is enabled in `config/settings.yaml`.
+- Run `python main.py run --period morning` directly and watch for delivery errors in the output.
+- Check that your Resend domain and sender address are verified in the Resend dashboard.
+
+### LLM summaries are missing or falling back to extractive output
+
+- Check that `PPLX_API_KEY` is set and valid in `.env`.
+- If using a local llama.cpp server, confirm `LLAMA_CPP_BASE_URL` is reachable and the model is loaded.
+- Review per-run LLM call caps in `config/settings.yaml` — hitting the cap silently falls back to heuristic output.
+- Check request timeout settings; a slow local model can exceed the timeout and trigger the fallback.
+
+### Database errors on startup
+
+- Run `python main.py db migrate` to ensure the schema is current.
+- Confirm the `data/` directory exists and is writable.
+- Check the `sqlite_path` in `config/settings.yaml` matches the actual file location.
+- If the database is corrupted, delete `data/newsbot.sqlite` and re-run `db migrate` to start fresh.
+
+### Source validation fails
+
+- Run `python main.py sources check` for a detailed report on which sources are reachable.
+- Google News proxy feeds and scraper-backed sources are the most likely to drift. Review the `url` and `scraper_class` fields for affected sources.
+- If a scraper stops returning articles, the target site's HTML structure has likely changed. Update the CSS selectors in `config/sources.yaml` or the scraper class itself.
+
+### Playwright scraper errors
+
+- Run `python -m playwright install chromium` to ensure the browser runtime is installed.
+- Playwright-backed scrapers are only required for live media-bias rating refresh. Standard ingestion does not need them.
+
+### Scheduler does not run at expected times
+
+- Confirm the cron expressions in `config/settings.yaml` are correct for your local timezone.
+- The scheduler is a blocking process — ensure it is running under a process manager that restarts it on failure.
+- Check system time and timezone settings on the host machine.
