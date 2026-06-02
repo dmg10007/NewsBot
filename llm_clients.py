@@ -145,26 +145,45 @@ class ComparisonLLMClient:
         return response.json()["choices"][0]["message"]["content"].strip()
 
     def _parse(self, cluster_id: int | None, content: str, provider: str) -> ReportingComparison:
+        framing = _section(content, "FRAMING")
+        raw_bias = _paragraph(content, "BIAS NOTES")
+        # Promote framing differences into bias_notes when the LLM returns an
+        # empty or missing BIAS NOTES section, so we never silently fall back
+        # to the default string when real framing data was parsed.
+        if not raw_bias and framing:
+            raw_bias = " ".join(framing[:2])
+        bias_notes = raw_bias or "No specific framing differences were identified."
         return ReportingComparison(
             cluster_id=cluster_id,
             shared_facts=_section(content, "SHARED FACTS"),
             source_specific_claims=_section(content, "SOURCE-SPECIFIC CLAIMS"),
             omissions=_section(content, "OMISSIONS"),
-            framing_differences=_section(content, "FRAMING"),
-            bias_notes=_paragraph(content, "BIAS NOTES") or "No specific framing differences were identified.",
+            framing_differences=framing,
+            bias_notes=bias_notes,
             provider_used=provider,
             confidence=0.8,
         )
 
 
 def _summary_prompt(cluster: StoryCluster, comparison: ReportingComparison) -> str:
+    # Place the representative article first so it anchors the truncation
+    # window and the LLM treats it as the primary frame of reference.
+    rep = cluster.representative_article
+    other_articles = [a for a in cluster.articles if a is not rep]
+    ordered = ([rep] if rep else []) + other_articles
+
     articles = "\n\n".join(
         f"SOURCE: {a.source_name} ({a.bias_lean})\nHEADLINE: {a.headline}\nSUMMARY: {a.summary or a.body_text}"
-        for a in cluster.articles
+        for a in ordered
     )
-    return f"""Write a concise 2-3 sentence neutral digest summary.
+    return f"""Write a concise 2-3 sentence neutral digest summary of this story.
+
+The headline for this story is:
+"{cluster.representative_headline}"
 
 Rules:
+- Your summary MUST directly support and expand on the headline above.
+- Do not summarize a different angle or sub-topic from the articles.
 - Prefer facts shared across sources.
 - Preserve attribution for disputed or single-source claims.
 - Remove loaded adjectives, speculation, opinion framing, and unsupported causal language.
@@ -241,5 +260,11 @@ def _section(content: str, title: str) -> list[str]:
 
 
 def _paragraph(content: str, title: str) -> str:
-    match = re.search(rf"{re.escape(title)}:\s*(.+)$", content, re.S)
+    # Capture content starting on the same line OR the next line after the
+    # header. The old pattern required content immediately after the colon,
+    # missing cases where the model emitted a newline before the text.
+    match = re.search(
+        rf"{re.escape(title)}:\s*\n?(.*?)(?=\n[A-Z][A-Z\-\s]+:|$)",
+        content, re.S
+    )
     return match.group(1).strip() if match else ""
