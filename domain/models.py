@@ -178,9 +178,10 @@ class Article:
 @dataclass(frozen=True)
 class SourceLink:
     source_name: str
-    url: str
+    url: str                   # outlet root URL — kept as fallback
     bias_lean: str = "unknown"
     credibility: str = "medium"
+    article_url: str = ""      # direct link to the specific article
 
 
 @dataclass

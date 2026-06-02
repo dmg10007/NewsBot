@@ -145,20 +145,24 @@ class ComparisonLLMClient:
         return response.json()["choices"][0]["message"]["content"].strip()
 
     def _parse(self, cluster_id: int | None, content: str, provider: str) -> ReportingComparison:
-        framing = _section(content, "FRAMING")
-        raw_bias = _paragraph(content, "BIAS NOTES")
-        # Promote framing differences into bias_notes when the LLM returns an
-        # empty or missing BIAS NOTES section, so we never silently fall back
-        # to the default string when real framing data was parsed.
-        if not raw_bias and framing:
-            raw_bias = " ".join(framing[:2])
-        bias_notes = raw_bias or "No specific framing differences were identified."
+        shared = _section(content, "SHARED FACTS")
+        specific = _section(content, "SOURCE-SPECIFIC CLAIMS")
+        omissions = _section(content, "OMISSIONS")
+        # SOURCE PERSPECTIVES replaces the old FRAMING + BIAS NOTES split.
+        # Each bullet is "Outlet (Bias): one-sentence angle." Joined with
+        # newlines so the renderer can display them line-by-line.
+        perspectives = _section(content, "SOURCE PERSPECTIVES")
+        if perspectives:
+            bias_notes = "\n".join(perspectives)
+        else:
+            # Fallback: try old BIAS NOTES section for backward compat.
+            bias_notes = _paragraph(content, "BIAS NOTES") or "No framing differences identified."
         return ReportingComparison(
             cluster_id=cluster_id,
-            shared_facts=_section(content, "SHARED FACTS"),
-            source_specific_claims=_section(content, "SOURCE-SPECIFIC CLAIMS"),
-            omissions=_section(content, "OMISSIONS"),
-            framing_differences=framing,
+            shared_facts=shared,
+            source_specific_claims=specific,
+            omissions=omissions,
+            framing_differences=[],   # retired; kept for contract compatibility
             bias_notes=bias_notes,
             provider_used=provider,
             confidence=0.8,
@@ -166,57 +170,63 @@ class ComparisonLLMClient:
 
 
 def _summary_prompt(cluster: StoryCluster, comparison: ReportingComparison) -> str:
-    # Place the representative article first so it anchors the truncation
-    # window and the LLM treats it as the primary frame of reference.
+    shared = "\n".join(f"- {f}" for f in comparison.shared_facts) or "None extracted."
+    specific = "\n".join(f"- {c}" for c in comparison.source_specific_claims) or "None extracted."
+
     rep = cluster.representative_article
     other_articles = [a for a in cluster.articles if a is not rep]
     ordered = ([rep] if rep else []) + other_articles
 
-    articles = "\n\n".join(
-        f"SOURCE: {a.source_name} ({a.bias_lean})\nHEADLINE: {a.headline}\nSUMMARY: {a.summary or a.body_text}"
+    excerpts = "\n\n".join(
+        f"[{a.source_name} / {a.bias_lean}]\n{a.summary or a.headline}"
         for a in ordered
     )
-    return f"""Write a concise 2-3 sentence neutral digest summary of this story.
+    return f"""Write a 2-3 sentence neutral digest summary of this story.
 
-The headline for this story is:
-"{cluster.representative_headline}"
+Headline: "{cluster.representative_headline}"
 
-Rules:
-- Your summary MUST directly support and expand on the headline above.
-- Do not summarize a different angle or sub-topic from the articles.
-- Prefer facts shared across sources.
-- Preserve attribution for disputed or single-source claims.
+Your summary MUST:
+- Directly expand on the headline above. Do not pivot to a different angle.
+- Synthesize information ACROSS all sources listed below, not just one.
+- Preserve attribution for single-source or disputed claims.
 - Remove loaded adjectives, speculation, opinion framing, and unsupported causal language.
 
-Shared facts:
-{'; '.join(comparison.shared_facts)}
+Base your summary primarily on these cross-source facts:
 
-Source-specific claims:
-{'; '.join(comparison.source_specific_claims)}
+SHARED FACTS (reported by multiple sources):
+{shared}
 
-Articles:
-{articles[:5000]}
+SOURCE-SPECIFIC CLAIMS (single-source details worth including):
+{specific}
+
+SUPPORTING EXCERPTS (for context only — do not summarize just one):
+{excerpts[:3000]}
 """
 
 
 def _comparison_prompt(cluster: StoryCluster) -> str:
     articles = "\n\n".join(
-        f"SOURCE: {a.source_name}\nBIAS: {a.bias_lean}\nHEADLINE: {a.headline}\nSUMMARY: {a.summary or a.body_text}"
+        f"SOURCE: {a.source_name}\nBIAS LABEL: {a.bias_lean}\nHEADLINE: {a.headline}\nEXCERPT: {a.summary or a.body_text}"
         for a in cluster.articles
     )
-    return f"""Compare these articles about the same story.
+    return f"""Compare how each source below covers this story.
 
-Return exactly:
+Return exactly these sections:
+
 SHARED FACTS:
-- facts most/all sources report
+- bullet per fact reported by most/all sources
+
 SOURCE-SPECIFIC CLAIMS:
-- claims or details only some sources include, with attribution
+- "Source: claim" for details only that source includes
+
 OMISSIONS:
-- meaningful omissions or missing details
-FRAMING:
-- differences in numbers, dates, attribution, emphasis, or language
-BIAS NOTES:
-2-3 neutral sentences. Mention source bias labels only as labels, not proof of accuracy.
+- meaningful facts one or more sources leave out
+
+SOURCE PERSPECTIVES:
+- One bullet per source in this format:
+  "Source Name (Bias Label): one sentence describing their specific angle, framing, or emphasis."
+- Be concrete — name the specific language, omission, or emphasis that distinguishes each outlet.
+- Do not repeat the shared facts here.
 
 ARTICLES:
 {articles[:6000]}
@@ -226,16 +236,18 @@ ARTICLES:
 def _heuristic_comparison(cluster: StoryCluster) -> ReportingComparison:
     headlines = [a.headline for a in cluster.articles]
     leans = sorted({a.bias_lean for a in cluster.articles if a.bias_lean})
+    perspectives = [
+        f"{a.source_name} ({a.bias_lean}): {a.summary or a.headline}"
+        for a in cluster.articles[:6]
+    ]
     return ReportingComparison(
         cluster_id=cluster.cluster_id,
         shared_facts=headlines[:3],
         source_specific_claims=[
             f"{a.source_name}: {a.summary or a.headline}" for a in cluster.articles[:5]
         ],
-        framing_differences=[
-            f"Configured source bias labels represented: {', '.join(leans) or 'unknown'}."
-        ],
-        bias_notes="Automated LLM comparison was unavailable; this note is based on source metadata and article summaries.",
+        framing_differences=[],
+        bias_notes="\n".join(perspectives) or "Automated comparison unavailable.",
         provider_used="heuristic",
         confidence=0.4,
         fallback_used=True,
@@ -260,9 +272,6 @@ def _section(content: str, title: str) -> list[str]:
 
 
 def _paragraph(content: str, title: str) -> str:
-    # Capture content starting on the same line OR the next line after the
-    # header. The old pattern required content immediately after the colon,
-    # missing cases where the model emitted a newline before the text.
     match = re.search(
         rf"{re.escape(title)}:\s*\n?(.*?)(?=\n[A-Z][A-Z\-\s]+:|$)",
         content, re.S
