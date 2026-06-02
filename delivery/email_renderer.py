@@ -117,7 +117,7 @@ class EmailRenderer:
 </html>"""
 
     def _render_story(self, story: DigestStory) -> str:
-        top_url = story.source_links[0].url if story.source_links else ""
+        top_url = story.source_links[0].article_url or story.source_links[0].url if story.source_links else ""
         headline = html.escape(story.headline)
         headline_html = (
             f'<a href="{html.escape(top_url)}" style="color:#1a1a1a;text-decoration:none;'
@@ -130,21 +130,23 @@ class EmailRenderer:
             if story.is_single_source
             else f"{story.source_count} sources"
         )
-        comparison = story.comparison
-        details = comparison.framing_differences or comparison.omissions or comparison.source_specific_claims
-        detail_html = ""
-        if details:
-            detail_html = (
-                f'<p style="margin:8px 0 0;font-size:12px;color:#666;'
+        # Render a single unified Source Perspectives callout block.
+        # bias_notes now contains one line per outlet from the SOURCE PERSPECTIVES
+        # section of the comparison prompt, replacing the old split
+        # 'Reporting differences' / 'Bias note' display.
+        perspectives_html = ""
+        if story.comparison.bias_notes and not story.is_single_source:
+            # Each perspective is on its own line; render as individual rows
+            # so the callout stays scannable with many sources.
+            lines = [
+                l.strip() for l in story.comparison.bias_notes.splitlines() if l.strip()
+            ]
+            rows = "<br>".join(html.escape(l) for l in lines)
+            perspectives_html = (
+                f'<p style="margin:10px 0 0;font-size:12px;color:#444;'
                 f'border-left:3px solid #e0e0e0;padding-left:10px;'
-                f'font-family:{_FONT_STACK};line-height:1.5;">'
-                f'<strong>Reporting differences:</strong> {html.escape(details[0])}</p>'
-            )
-        if comparison.bias_notes:
-            detail_html += (
-                f'<p style="margin:6px 0 0;font-size:12px;color:#666;'
-                f'font-family:{_FONT_STACK};line-height:1.5;">'
-                f'<strong>Bias note:</strong> {html.escape(comparison.bias_notes)}</p>'
+                f'font-family:{_FONT_STACK};line-height:1.7;">'
+                f'<strong>Source perspectives:</strong><br>{rows}</p>'
             )
         return f"""
 <tr><td style="padding:16px 0;border-bottom:1px solid #f0f0f0;">
@@ -152,18 +154,15 @@ class EmailRenderer:
   <p style="margin:0 0 8px;font-size:12px;color:#777;font-family:{_FONT_STACK};">{html.escape(source_note)}</p>
   <p style="margin:0 0 10px;font-size:14px;line-height:1.7;color:#333;font-family:{_FONT_STACK};">{html.escape(story.summary)}</p>
   <div style="line-height:2.0;">{self._render_sources(story.source_links)}</div>
-  {detail_html}
+  {perspectives_html}
 </td></tr>"""
 
     def _render_sources(self, links: list[SourceLink]) -> str:
         chips = []
-        seen = set()
         for link in links:
-            if link.source_name in seen:
-                continue
-            seen.add(link.source_name)
+            href = html.escape(link.article_url or link.url)
             chips.append(
-                f'<a href="{html.escape(link.url)}" style="display:inline-block;margin:2px 4px 2px 0;'
+                f'<a href="{href}" style="display:inline-block;margin:2px 4px 2px 0;'
                 f'font-size:12px;color:#333;text-decoration:none;background:#f0f0f0;'
                 f'padding:3px 8px;border-radius:4px;font-family:{_FONT_STACK};">'
                 f'{html.escape(link.source_name)}</a>{_bias_badge(link.bias_lean, self._bias_colors)}'

@@ -109,15 +109,7 @@ class DigestPipeline:
                     geo_tier=cluster.geo_tier,
                     topic=cluster.topic,
                     importance_score=cluster.importance_score,
-                    source_links=[
-                        SourceLink(
-                            source_name=a.source_name,
-                            url=a.url,
-                            bias_lean=a.bias_lean or "unknown",
-                            credibility=a.credibility,
-                        )
-                        for a in cluster.articles
-                    ],
+                    source_links=_build_source_links(cluster.articles),
                     comparison=comparison,
                     source_count=cluster.source_count,
                     is_single_source=cluster.is_single_source,
@@ -214,6 +206,31 @@ class DigestPipeline:
             EmailSender().send(html, period=run.period, run_date=run.started_at)
         if delivery_cfg.get("telegram", {}).get("enabled"):
             TelegramSender().send_digest(stories, period=run.period)
+
+
+def _build_source_links(articles: list[Article]) -> list[SourceLink]:
+    """Build deduplicated SourceLink list from cluster articles.
+
+    Deduplicates by publisher_name so the same outlet never appears twice
+    in the source chip row (e.g. AP Top News + AP Politics -> one AP chip).
+    The article with the highest-quality canonical_url for each publisher
+    is kept; ties go to the first article encountered.
+    """
+    seen_publishers: set[str] = set()
+    links: list[SourceLink] = []
+    for article in articles:
+        publisher = article.publisher_name or article.source_name
+        if publisher in seen_publishers:
+            continue
+        seen_publishers.add(publisher)
+        links.append(SourceLink(
+            source_name=article.source_name,
+            url=article.source_url,
+            bias_lean=article.bias_lean or "unknown",
+            credibility=article.credibility,
+            article_url=article.canonical_url,
+        ))
+    return links
 
 
 def _sqlite_path(settings: dict) -> Path:
