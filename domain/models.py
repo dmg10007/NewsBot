@@ -203,6 +203,22 @@ class StoryCluster:
     def is_single_source(self) -> bool:
         return self.source_count <= 1
 
+    @property
+    def representative_article(self) -> Optional[Article]:
+        """Return the Article whose headline matches representative_headline.
+
+        Falls back to the first article in the cluster if no exact match is
+        found. Used by the summary prompt to anchor article ordering so the
+        LLM treats the representative article as the primary frame of
+        reference rather than whichever article happens to sort first.
+        """
+        if not self.articles:
+            return None
+        for article in self.articles:
+            if article.headline == self.representative_headline:
+                return article
+        return self.articles[0]
+
 
 @dataclass
 class ReportingComparison:
