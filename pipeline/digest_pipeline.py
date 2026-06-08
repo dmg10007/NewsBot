@@ -17,6 +17,7 @@ from domain.models import Article, ArticleDraft, DigestRun, DigestStory, Source,
 from geography import GeographyClassifier, profile_from_settings
 from ingestion.fetcher import FeedFetcher
 from ingestion.scraper import SCRAPER_REGISTRY
+from ingestion.seen_story_cache import SeenStoryCache
 from llm_clients import ComparisonLLMClient, SummaryLLMClient
 from sources import load_sources_from_config
 from storage import SQLiteStore
@@ -51,6 +52,7 @@ class DigestPipeline:
         self.summary_client = summary_client or SummaryLLMClient(self.settings)
         self.geo = GeographyClassifier(profile_from_settings(self.settings))
         self.bias_resolver = BiasResolver(auto_scrape=False)
+        self.seen_cache = SeenStoryCache(self.settings)
 
     def close(self) -> None:
         self.store.close()
@@ -79,6 +81,10 @@ class DigestPipeline:
         articles = [Article.from_draft(draft, geo_profile=self.geo.profile.name) for draft in drafts]
         self._enrich_bias(articles)
         articles = self.geo.classify_all(articles)
+        # Filter out articles seen in previous runs (JSON-file cache layer).
+        # This runs before upsert_articles so already-seen stories never
+        # enter the DB as candidates for the current digest.
+        articles = self.seen_cache.filter_seen(articles)
         if not dry_run:
             articles = self.store.upsert_articles(articles)
         logger.info("Ingested %d articles after geographic filtering", len(articles))
@@ -88,6 +94,7 @@ class DigestPipeline:
         start = datetime.now(timezone.utc)
         run = self.store.create_digest_run(DigestRun(run_id=None, period=period, started_at=start))
         stories: list[DigestStory] = []
+        delivered_articles: list[Article] = []
         try:
             articles = self.ingest(dry_run=False)
             articles = self._suppress_recent_articles(articles, period)
@@ -119,10 +126,16 @@ class DigestPipeline:
                         a.article_id for a in cluster.articles if a.article_id is not None
                     ],
                 ))
+                # Track articles that made it into a delivered cluster.
+                delivered_articles.extend(cluster.articles)
 
             self.store.save_digest_stories(run, stories)
             if deliver:
                 self._deliver(stories, run)
+                # Only mark as seen after successful delivery so a failed
+                # delivery run doesn't permanently suppress the stories.
+                self.seen_cache.mark_seen(delivered_articles)
+                self.seen_cache.save()
         except Exception as exc:
             run.failures.append(f"{type(exc).__name__}: {exc}")
             logger.exception("Digest pipeline failed")
@@ -182,8 +195,6 @@ class DigestPipeline:
 
     def _enrich_bias(self, articles: list[Article]) -> None:
         for article in articles:
-            # Source config already sets a known bias_lean for all configured
-            # sources. Only attempt live resolution for unknown/unset values.
             if article.bias_lean and article.bias_lean != "unknown":
                 continue
             domain = urlparse(article.canonical_url).netloc
@@ -213,8 +224,6 @@ def _build_source_links(articles: list[Article]) -> list[SourceLink]:
 
     Deduplicates by publisher_name so the same outlet never appears twice
     in the source chip row (e.g. AP Top News + AP Politics -> one AP chip).
-    The article with the highest-quality canonical_url for each publisher
-    is kept; ties go to the first article encountered.
     """
     seen_publishers: set[str] = set()
     links: list[SourceLink] = []
